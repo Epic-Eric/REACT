@@ -1,0 +1,3 @@
+[submodule "emg2pose"]
+	path = emg2pose
+	url = https://github.com/facebookresearch/emg2pose.git
