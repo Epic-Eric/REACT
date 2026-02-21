@@ -74,7 +74,8 @@ class MultiHeadSelfAttention(nn.Module):
         
         Args:
             x: Input tensor of shape (B, N, D).
-            mask: Optional attention mask of shape (B, N, N) or (B, 1, N).
+            mask: Optional attention mask of shape (B, N) for key masking,
+                  or (B, N, N) for full attention masking.
         
         Returns:
             Output tensor of shape (B, N, D).
@@ -90,7 +91,14 @@ class MultiHeadSelfAttention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale
         
         if mask is not None:
-            attn = attn.masked_fill(mask.unsqueeze(1) == 0, float('-inf'))
+            # Handle both 2D key mask (B, N) and 3D attention mask (B, N, N)
+            if mask.dim() == 2:
+                # Key mask: (B, N) -> (B, 1, 1, N) for broadcasting
+                mask = mask.unsqueeze(1).unsqueeze(2)
+            elif mask.dim() == 3:
+                # Full attention mask: (B, N, N) -> (B, 1, N, N)
+                mask = mask.unsqueeze(1)
+            attn = attn.masked_fill(mask == 0, float('-inf'))
         
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)

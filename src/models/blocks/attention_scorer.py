@@ -35,6 +35,18 @@ class AttentionScorerConfig:
     dropout: float = 0.1
 
 
+class Conv1dLayerNorm(nn.Module):
+    """LayerNorm wrapper for Conv1d output (handles B, C, L -> B, L, C transpose)."""
+    
+    def __init__(self, num_channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(num_channels)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, L) -> transpose -> (B, L, C) -> norm -> transpose back
+        return self.norm(x.transpose(-1, -2)).transpose(-1, -2)
+
+
 class AttentionScorer(nn.Module):
     """Computes attention scores over temporal dimension.
     
@@ -55,7 +67,7 @@ class AttentionScorer(nn.Module):
         for i in range(config.num_layers - 1):
             layers.extend([
                 nn.Conv1d(current_channels, config.hidden_channels, kernel_size=1),
-                nn.LayerNorm([config.hidden_channels]),
+                Conv1dLayerNorm(config.hidden_channels),
                 nn.GELU(),
                 nn.Dropout(config.dropout),
             ])

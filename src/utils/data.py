@@ -27,8 +27,8 @@ except ImportError:
     )
 
 
-# Default dataset location
-DEFAULT_DATA_DIR = Path.home() / "emg2pose_dataset_mini"
+# Default dataset location - look in src/data/ relative to this file
+DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data" / "emg2pose_dataset_mini"
 DATASET_URL = "https://fb-ctrl-oss.s3.amazonaws.com/emg2pose/emg2pose_dataset_mini.tar"
 
 
@@ -81,6 +81,7 @@ class CalibratedEmgDataset(Dataset):
     """EMG dataset with calibration samples for user adaptation.
     
     Wraps WindowedEmgDataset and adds calibration sample retrieval.
+    Each sample gets a random number of calibration samples (1 to max_k).
     """
     
     def __init__(
@@ -91,8 +92,9 @@ class CalibratedEmgDataset(Dataset):
         stride: int = 2_000,
         jitter: bool = False,
         skip_ik_failures: bool = True,
-        calibration_k: int = 5,
+        calibration_k: int = 5,  # Max K (actual K sampled randomly per item)
         calibration_pool_size: int = 50,
+        min_calibration_k: int = 1,  # Minimum K to sample
     ):
         """Initialize dataset.
         
@@ -103,12 +105,14 @@ class CalibratedEmgDataset(Dataset):
             stride: Stride between windows.
             jitter: Random offset during training.
             skip_ik_failures: Skip windows with IK failures.
-            calibration_k: Number of calibration samples per batch item.
+            calibration_k: Maximum calibration samples per batch item.
             calibration_pool_size: Size of calibration pool per user.
+            min_calibration_k: Minimum calibration samples to sample.
         """
         self.data_dir = Path(data_dir)
         self.session_names = session_names
-        self.calibration_k = calibration_k
+        self.max_calibration_k = calibration_k  # Max K for padding
+        self.min_calibration_k = min_calibration_k
         self.calibration_pool_size = calibration_pool_size
         
         # Create windowed datasets for each session
@@ -193,17 +197,31 @@ class CalibratedEmgDataset(Dataset):
         sample["user_id"] = user_id
         sample["session_name"] = self.session_names[ds_idx]
         
-        # Sample calibration data for this user
+        # Sample RANDOM K for this item (between min and max)
         cal_pool = self.calibration_pools.get(user_id, [])
-        if len(cal_pool) >= self.calibration_k:
-            cal_indices = np.random.choice(len(cal_pool), self.calibration_k, replace=False)
-            calibration_emg = torch.stack([cal_pool[i] for i in cal_indices])
-        else:
-            # Fallback: duplicate samples if pool too small
-            calibration_emg = torch.stack([sample["emg"]] * self.calibration_k)
+        pool_size = len(cal_pool)
         
-        sample["calibration_emg"] = calibration_emg
-        sample["calibration_k"] = self.calibration_k
+        # Determine actual K for this sample (random within bounds)
+        max_k = min(self.max_calibration_k, pool_size) if pool_size > 0 else self.max_calibration_k
+        min_k = min(self.min_calibration_k, max_k)
+        actual_k = np.random.randint(min_k, max_k + 1)  # Random K for THIS sample
+        
+        # Sample calibration recordings for this user
+        if pool_size >= actual_k:
+            cal_indices = np.random.choice(pool_size, actual_k, replace=False)
+            cal_samples = [cal_pool[i] for i in cal_indices]
+        else:
+            # Fallback: use current sample if pool too small
+            cal_samples = [sample["emg"]] * actual_k
+        
+        # Pad to max_calibration_k with zeros (for batching)
+        emg_shape = sample["emg"].shape  # (16, L)
+        padded_calibration = torch.zeros(self.max_calibration_k, *emg_shape)
+        for i, cal_emg in enumerate(cal_samples):
+            padded_calibration[i] = cal_emg
+        
+        sample["calibration_emg"] = padded_calibration  # (max_k, 16, L)
+        sample["calibration_k"] = actual_k  # Actual number of valid samples (varies per item!)
         
         return sample
 
@@ -216,6 +234,7 @@ def create_dataloaders(
     batch_size: int = 32,
     num_workers: int = 4,
     calibration_k: int = 5,
+    min_calibration_k: int = 1,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """Create train, validation, and test DataLoaders.
     
@@ -226,7 +245,8 @@ def create_dataloaders(
         stride: Stride between windows.
         batch_size: Batch size.
         num_workers: Number of data loading workers.
-        calibration_k: Number of calibration samples.
+        calibration_k: Max number of calibration samples.
+        min_calibration_k: Min number of calibration samples.
     
     Returns:
         Tuple of (train_loader, val_loader, test_loader).
@@ -249,6 +269,7 @@ def create_dataloaders(
         stride=stride,
         jitter=True,
         calibration_k=calibration_k,
+        min_calibration_k=min_calibration_k,
     )
     
     val_dataset = CalibratedEmgDataset(
@@ -258,6 +279,7 @@ def create_dataloaders(
         stride=stride,
         jitter=False,
         calibration_k=calibration_k,
+        min_calibration_k=min_calibration_k,
     )
     
     test_dataset = CalibratedEmgDataset(
@@ -267,6 +289,7 @@ def create_dataloaders(
         stride=stride,
         jitter=False,
         calibration_k=calibration_k,
+        min_calibration_k=min_calibration_k,
     )
     
     # Create loaders

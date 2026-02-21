@@ -9,7 +9,11 @@ from .blocks import (
     TransformerGroupEncoder,
 )
 from .user_encoder import UserEncoder, UserEncoderConfig
-from .hybrid_model import FiLMConditionedModel, FiLMConditionedModelConfig
+from .hybrid_model import (
+    FiLMConditionedModel,
+    FiLMConditionedModelConfig,
+    load_pretrained_encoder,
+)
 
 __all__ = [
     "FiLMLayer",
@@ -21,4 +25,5 @@ __all__ = [
     "UserEncoderConfig",
     "FiLMConditionedModel",
     "FiLMConditionedModelConfig",
+    "load_pretrained_encoder",
 ]

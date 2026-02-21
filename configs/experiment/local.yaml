@@ -1,0 +1,57 @@
+# Local training configuration (MPS/CPU on mini dataset)
+
+# Training parameters
+training:
+  num_epochs: 50
+  batch_size: 8
+  gradient_clip_norm: 1.0
+  num_workers: 0  # 0 for macOS compatibility
+  
+  # Optimizer
+  optimizer:
+    name: adamw
+    lr: 1e-4
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+    eps: 1e-8
+  
+  # Scheduler
+  scheduler:
+    name: cosine
+    min_lr: 0.0
+  
+  # Checkpointing
+  checkpoint:
+    save_every: 5
+    save_best: true
+
+# Device settings
+device: auto  # auto selects cuda > mps > cpu
+
+# Model configuration
+model:
+  feature_dim: 64
+  user_embedding_dim: 128
+  freeze_encoder: true
+  pretrained_checkpoint: emg2pose_model_checkpoints/regression_vemg2pose.ckpt
+
+# Data configuration  
+data:
+  # Dataset path (relative to project root)
+  data_dir: src/data/emg2pose_dataset_mini
+  window_length: 10000
+  stride: 2000
+  
+  # Calibration
+  calibration:
+    k_min: 1
+    k_max: 5
+
+# Output settings
+output:
+  dir: outputs
+  save_predictions: true
+  plot_every: 5
+
+# Reproducibility
+seed: 42
