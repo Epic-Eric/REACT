@@ -158,8 +158,7 @@ def setup_and_run_test(
 			"emg2pose.test_analysis",
 			f"data_location={home_dataset_dir}",
 			f"experiment={experiment}",
-	# Use .spawn() to prevent client-side timeout during long downloads
-	setup_and_run_test.spawnkpoints_dir / checkpoint_name}",
+			f"checkpoint={home_checkpoints_dir / checkpoint_name}",
 		]
 		print(f"$ {' '.join(cmd)}")
 		subprocess.run(cmd, cwd=REMOTE_REPO_PATH, env=env, check=True)
@@ -172,6 +171,8 @@ def main(
 	experiment: str = "tracking_vemg2pose",
 	checkpoint_name: str = "tracking_vemg2pose.ckpt",
 ):
+	# Temporarily using .remote() to see startup errors
+	# Switch back to .spawn() once it's working
 	setup_and_run_test.remote(
 		download_dataset=download_dataset,
 		run_test_analysis=run_test_analysis,
