@@ -92,7 +92,7 @@ react info
 ```python
 import torch
 from src.models.hybrid_model import FiLMConditionedModel, FiLMConditionedModelConfig
-from src.utils.dummy_data import create_dummy_batch
+from src.utils.data import create_dummy_batch, create_dataloaders
 
 # Create model
 config = FiLMConditionedModelConfig(
@@ -102,7 +102,7 @@ config = FiLMConditionedModelConfig(
 )
 model = FiLMConditionedModel(config)
 
-# Create dummy batch
+# Create dummy batch (for quick testing without data)
 batch = create_dummy_batch(batch_size=4, calibration_k=10)
 
 # Forward pass
@@ -110,14 +110,17 @@ output = model(
     encoded_features=batch["emg"],  # Would be encoder output
     calibration_features=batch["calibration_emg"],
 )
-print(output["predictions"].shape)  # (4, 20, 256)
+print(output["predictions"].shape)  # (4, 20, 10000)
+
+# Load real data (requires emg2pose_dataset_mini)
+# train_loader, val_loader, test_loader = create_dataloaders()
 ```
 
 ### Modal Cloud Training
 
 ```bash
-# Train on Modal with GPU
-modal run scripts/modal_train.py --epochs 100 --use-dummy-data
+# Train on Modal with GPU (uses emg2pose_dataset_mini)
+modal run scripts/modal_train.py --epochs 100
 
 # List available checkpoints
 modal run scripts/modal_train.py --list-ckpts

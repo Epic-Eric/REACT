@@ -167,7 +167,7 @@ def train(
         import torch
         from ..engine.trainer import Trainer, TrainerConfig, DummyTrainer
         from ..models.hybrid_model import FiLMConditionedModel, FiLMConditionedModelConfig
-        from ..utils.dummy_data import create_dummy_dataloaders
+        from ..utils.data import create_dataloaders, create_dummy_batch
         
         # Set seed
         torch.manual_seed(seed)

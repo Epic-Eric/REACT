@@ -66,6 +66,9 @@ VOLUME_MOUNT_PATH = "/persistent"
 CHECKPOINTS_URL = (
     "https://fb-ctrl-oss.s3.amazonaws.com/emg2pose/emg2pose_model_checkpoints.tar.gz"
 )
+DATASET_URL = (
+    "https://fb-ctrl-oss.s3.amazonaws.com/emg2pose/emg2pose_dataset_mini.tar"
+)
 
 # Create Modal app
 app = modal.App("react-emg-training")
@@ -132,7 +135,6 @@ def train_model(
     experiment_name: str = "film_adaptive",
     use_pretrained: bool = True,
     pretrained_checkpoint: str = "tracking_vemg2pose.ckpt",
-    use_dummy_data: bool = False,
 ) -> dict:
     """Train FiLM-conditioned model on Modal.
     
@@ -144,7 +146,6 @@ def train_model(
         experiment_name: Name for this experiment run.
         use_pretrained: Whether to load pretrained encoder.
         pretrained_checkpoint: Name of pretrained checkpoint file.
-        use_dummy_data: Use synthetic data for testing.
     
     Returns:
         Dictionary with training results.
@@ -153,6 +154,7 @@ def train_model(
     
     persistent_root = Path(VOLUME_MOUNT_PATH)
     checkpoints_dir = persistent_root / "emg2pose_model_checkpoints"
+    dataset_dir = persistent_root / "emg2pose_dataset_mini"
     output_dir = persistent_root / "react_outputs" / experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -177,7 +179,7 @@ def train_model(
     print("=" * 60)
     
     # Download pretrained checkpoints if needed
-    if use_pretrained and not use_dummy_data:
+    if use_pretrained:
         checkpoints_archive = persistent_root / "emg2pose_model_checkpoints.tar.gz"
         checkpoint_path = checkpoints_dir / pretrained_checkpoint
         
@@ -194,58 +196,141 @@ def train_model(
         
         print(f"Using pretrained encoder: {checkpoint_path}")
     
+    # Download dataset if needed
+    dataset_archive = persistent_root / "emg2pose_dataset_mini.tar"
+    if not dataset_dir.exists() or not any(dataset_dir.glob("*.hdf5")):
+        if not dataset_archive.exists():
+            print("Downloading emg2pose_dataset_mini...")
+            _run(["curl", "-L", DATASET_URL, "-o", str(dataset_archive)])
+        print("Extracting dataset...")
+        _run(["tar", "-xvf", str(dataset_archive), "-C", str(persistent_root)])
+        data_volume.commit()
+    
+    if not any(dataset_dir.glob("*.hdf5")):
+        raise FileNotFoundError(f"Dataset not found at {dataset_dir}")
+    
+    print(f"Using dataset: {dataset_dir}")
+    
     # Import training components
     sys.path.insert(0, REMOTE_REACT_EMG)
     if REMOTE_EMG2POSE:
         sys.path.insert(0, REMOTE_EMG2POSE)
     
-    from src.engine.trainer import DummyTrainer
+    from src.utils.data import create_dataloaders
+    from src.engine.trainer import Trainer, TrainerConfig
     from src.models.hybrid_model import FiLMConditionedModelConfig, FiLMConditionedModel
     
-    if use_dummy_data:
-        print("\nUsing dummy data for pipeline testing...")
-        
-        # Create and run dummy trainer
-        trainer = DummyTrainer(
-            emg_channels=16,
-            num_joints=20,
-            feature_dim=64,
-            user_embedding_dim=128,
-            calibration_k=calibration_k,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
-        
-        # Training loop
-        train_losses = []
-        for epoch in range(epochs):
-            loss = trainer.train_epoch()
-            train_losses.append(loss)
+    # Create data loaders
+    print("\nLoading data...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        data_dir=dataset_dir,
+        batch_size=batch_size,
+        num_workers=4,
+        calibration_k=calibration_k,
+    )
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Val batches: {len(val_loader)}")
+    
+    # Create model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_config = FiLMConditionedModelConfig(
+        emg_channels=16,
+        feature_dim=64,
+        user_embedding_dim=128,
+        num_joints=20,
+    )
+    model = FiLMConditionedModel(model_config).to(device)
+    
+    # Training setup
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = torch.nn.MSELoss()
+    
+    # Training loop
+    print("\nStarting training...")
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    
+    for epoch in range(epochs):
+        # Train
+        model.train()
+        epoch_losses = []
+        for batch in train_loader:
+            emg = batch["emg"].to(device)
+            targets = batch["joint_angles"].to(device)
+            calibration_emg = batch["calibration_emg"].to(device)
             
-            if (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch + 1}/{epochs} - Loss: {loss:.4f}")
+            optimizer.zero_grad()
+            output = model(
+                encoded_features=emg,
+                calibration_features=calibration_emg,
+            )
+            loss = criterion(output["predictions"], targets)
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(loss.item())
         
-        # Save results
-        results = {
-            "final_loss": train_losses[-1],
-            "train_losses": train_losses,
-            "epochs_completed": epochs,
-            "calibration_k": calibration_k,
-        }
+        avg_train_loss = sum(epoch_losses) / len(epoch_losses)
+        train_losses.append(avg_train_loss)
         
-        # Save checkpoint
-        checkpoint_out = output_dir / f"{experiment_name}_final.pt"
-        trainer.save_checkpoint(checkpoint_out)
-        data_volume.commit()
+        # Validate
+        model.eval()
+        val_epoch_losses = []
+        with torch.no_grad():
+            for batch in val_loader:
+                emg = batch["emg"].to(device)
+                targets = batch["joint_angles"].to(device)
+                calibration_emg = batch["calibration_emg"].to(device)
+                
+                output = model(
+                    encoded_features=emg,
+                    calibration_features=calibration_emg,
+                )
+                loss = criterion(output["predictions"], targets)
+                val_epoch_losses.append(loss.item())
         
-        print(f"\nTraining complete!")
-        print(f"Final loss: {results['final_loss']:.4f}")
-        print(f"Checkpoint saved: {checkpoint_out}")
+        avg_val_loss = sum(val_epoch_losses) / len(val_epoch_losses)
+        val_losses.append(avg_val_loss)
         
-        return results
-    else:
-        # Real training with actual data
-        print("\nReal training not yet fully implemented.")
-        print("Use --use-dummy-data for pipeline testing.")
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch + 1}/{epochs} - Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}")
+        
+        # Save best model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_checkpoint = output_dir / f"{experiment_name}_best.pt"
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": best_val_loss,
+            }, best_checkpoint)
+    
+    # Save final checkpoint
+    final_checkpoint = output_dir / f"{experiment_name}_final.pt"
+    torch.save({
+        "epoch": epochs,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+    }, final_checkpoint)
+    data_volume.commit()
+    
+    results = {
+        "final_train_loss": train_losses[-1],
+        "final_val_loss": val_losses[-1],
+        "best_val_loss": best_val_loss,
+        "epochs_completed": epochs,
+        "calibration_k": calibration_k,
+    }
+    
+    print(f"\nTraining complete!")
+    print(f"Final train loss: {results['final_train_loss']:.4f}")
+    print(f"Best val loss: {results['best_val_loss']:.4f}")
+    print(f"Checkpoints saved: {output_dir}")
+    
+    return results
         return {"status": "not_implemented"}
 
 
@@ -313,7 +398,6 @@ def main(
     learning_rate: float = 1e-4,
     calibration_k: int = 10,
     experiment_name: str = "film_adaptive",
-    use_dummy_data: bool = True,
     list_ckpts: bool = False,
 ):
     """Main entry point for Modal training.
@@ -324,7 +408,6 @@ def main(
         learning_rate: Learning rate.
         calibration_k: Number of calibration samples.
         experiment_name: Name for this experiment.
-        use_dummy_data: Use synthetic data for testing.
         list_ckpts: List available checkpoints and exit.
     """
     if list_ckpts:
@@ -338,7 +421,6 @@ def main(
     print(f"Experiment: {experiment_name}")
     print(f"Epochs: {epochs}, Batch size: {batch_size}")
     print(f"Calibration K: {calibration_k}")
-    print(f"Dummy data: {use_dummy_data}")
     
     results = train_model.remote(
         epochs=epochs,
@@ -346,12 +428,11 @@ def main(
         learning_rate=learning_rate,
         calibration_k=calibration_k,
         experiment_name=experiment_name,
-        use_dummy_data=use_dummy_data,
     )
     
     print("\n" + "=" * 60)
     print("Training Results:")
     print("=" * 60)
     for key, value in results.items():
-        if key != "train_losses":
+        if key not in ("train_losses", "val_losses"):
             print(f"  {key}: {value}")
