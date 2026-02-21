@@ -13,10 +13,11 @@ from .visualization import (
     plot_user_embeddings,
     plot_calibration_attention,
 )
-from .dummy_data import (
-    DummyDataGenerator,
-    create_dummy_dataset,
-    create_dummy_dataloaders,
+from .data import (
+    CalibratedEmgDataset,
+    create_dataloaders,
+    create_dummy_batch,
+    check_dataset_available,
 )
 
 __all__ = [
@@ -28,7 +29,8 @@ __all__ = [
     "plot_predictions",
     "plot_user_embeddings",
     "plot_calibration_attention",
-    "DummyDataGenerator",
-    "create_dummy_dataset",
-    "create_dummy_dataloaders",
+    "CalibratedEmgDataset",
+    "create_dataloaders",
+    "create_dummy_batch",
+    "check_dataset_available",
 ]
