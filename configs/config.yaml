@@ -1,0 +1,28 @@
+# REACT-EMG Main Configuration
+# Entry point for Hydra configuration
+
+defaults:
+  - model: film_conditioned
+  - training: default
+  - data: default
+  - _self_
+
+# Hydra output settings
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+# Global paths
+paths:
+  root: .
+  data_dir: ${paths.root}/data
+  output_dir: ${paths.root}/outputs
+  checkpoint_dir: ${paths.output_dir}/checkpoints
+  log_dir: ${paths.output_dir}/logs
+
+# Global settings
+debug: false
+verbose: true

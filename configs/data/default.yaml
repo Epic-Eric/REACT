@@ -1,0 +1,60 @@
+# Data configuration
+
+# Dataset paths
+data_dir: data
+train_sessions: null  # list of session paths
+val_sessions: null
+test_sessions: null
+
+# EMG signal parameters
+emg:
+  num_channels: 16
+  sample_rate: 2000
+  window_size: 256
+  stride: 64
+  
+# Pose parameters
+pose:
+  num_joints: 20
+  
+# Calibration sampling
+calibration:
+  # k range [min, max] for variable-k training
+  k_min: 0
+  k_max: 30
+  # Fixed k for evaluation (can override)
+  k_eval: 10
+  # Sampling strategy: uniform, truncated_normal, fixed, weighted
+  strategy: uniform
+  # Parameters for truncated_normal
+  truncated_normal_mean: 15
+  truncated_normal_std: 10
+  # Whether to sample from same user only
+  same_user_only: true
+  # Exclude current session from calibration
+  exclude_current_session: true
+
+# Preprocessing
+preprocessing:
+  normalize: zscore
+  bandpass:
+    enabled: true
+    low_freq: 20.0
+    high_freq: 450.0
+    order: 4
+
+# Data augmentation
+augmentation:
+  enabled: true
+  noise_std: 0.01
+  time_shift_max: 10
+  scale_range: [0.9, 1.1]
+  channel_dropout: 0.1
+
+# Data splitting
+split:
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  # User-aware splitting: ensure users in train/val/test don't overlap
+  user_aware: true

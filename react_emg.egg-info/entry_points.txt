@@ -1,0 +1,2 @@
+[console_scripts]
+react = src.cli.main:main

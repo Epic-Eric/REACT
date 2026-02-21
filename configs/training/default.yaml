@@ -1,0 +1,52 @@
+# Training configuration
+
+# Optimizer settings
+optimizer:
+  name: adamw
+  lr: 1e-4
+  weight_decay: 1e-5
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+# Learning rate scheduler
+scheduler:
+  name: cosine
+  warmup_epochs: 5
+  min_lr: 1e-7
+  
+# Training parameters
+num_epochs: 100
+batch_size: 32
+gradient_clip_norm: 1.0
+
+# Early stopping
+early_stopping:
+  enabled: true
+  patience: 15
+  min_delta: 1e-5
+  monitor: val_loss
+
+# Mixed precision training
+mixed_precision: true
+
+# Checkpointing
+checkpoint:
+  save_dir: checkpoints
+  save_every: 5
+  save_best: true
+
+# Logging
+logging:
+  log_every: 10
+  use_wandb: false
+  project_name: react-emg
+  run_name: null  # auto-generated if null
+
+# Device settings
+device: cuda
+num_workers: 4
+pin_memory: true
+
+# Reproducibility
+seed: 42
+deterministic: false

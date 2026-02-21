@@ -1,0 +1,33 @@
+# Experiment configuration: FiLM-conditioned user-adaptive training
+# Inherits from model, training, and data configs
+
+defaults:
+  - /model: film_conditioned
+  - /training: default
+  - /data: default
+  - _self_
+
+# Experiment metadata
+experiment:
+  name: film_user_adaptive
+  description: "FiLM-conditioned user-adaptive EMG-to-pose prediction"
+  version: "1.0"
+
+# Override paths (set these for your environment)
+paths:
+  pretrained_encoder: null  # path to pretrained vemg2pose checkpoint
+  output_dir: outputs
+  data_dir: data
+
+# Experiment-specific overrides
+model:
+  freeze_encoder: true
+
+training:
+  num_epochs: 100
+  batch_size: 32
+
+data:
+  calibration:
+    k_min: 0
+    k_max: 30
