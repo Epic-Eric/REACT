@@ -4,12 +4,17 @@
 """
 Modal cloud training script for REACT-EMG on full emg2pose dataset.
 
-Loads configuration from configs/experiment/modal.yaml.
-Trains FiLM-conditioned model with pretrained vemg2pose encoder on Modal cloud.
+Supports both regression and tracking modes, aligned with emg2pose configs.
 
 Usage:
+    # Default (regression mode)
     modal run scripts/train_modal.py
-    modal run scripts/train_modal.py --epochs 50 --batch-size 16
+    
+    # Tracking mode
+    modal run scripts/train_modal.py --config tracking
+    
+    # With overrides
+    modal run scripts/train_modal.py --config regression --epochs 100
 """
 
 from __future__ import annotations
@@ -25,7 +30,17 @@ import modal
 # Modal Configuration
 # =============================================================================
 
-# Find local directories for upload
+# Remote paths (used in container)
+REMOTE_EMG2POSE = "/root/emg2pose"
+REMOTE_SRC = "/root/src"
+REMOTE_CONFIGS = "/root/configs"
+
+# Volume paths
+VOLUME_MOUNT_PATH = "/persistent"
+FULL_DATASET_URL = "https://fb-ctrl-oss.s3.amazonaws.com/emg2pose/emg2pose_dataset.tar"
+CHECKPOINTS_URL = "https://fb-ctrl-oss.s3.amazonaws.com/emg2pose/emg2pose_model_checkpoints.tar.gz"
+
+# Find local directories for upload (only runs locally, not in container)
 def _find_local_dirs() -> tuple[Path, Path, Path]:
     """Find local emg2pose, src, and configs directories."""
     here = Path(__file__).resolve().parent.parent
@@ -43,15 +58,15 @@ def _find_local_dirs() -> tuple[Path, Path, Path]:
     return emg2pose_path, src_path, configs_path
 
 
-LOCAL_EMG2POSE, LOCAL_SRC, LOCAL_CONFIGS = _find_local_dirs()
-REMOTE_EMG2POSE = "/root/emg2pose"
-REMOTE_SRC = "/root/src"
-REMOTE_CONFIGS = "/root/configs"
-
-# Volume paths
-VOLUME_MOUNT_PATH = "/persistent"
-FULL_DATASET_URL = "https://fb-ctrl-oss.s3.amazonaws.com/emg2pose/emg2pose_dataset.tar"
-CHECKPOINTS_URL = "https://fb-ctrl-oss.s3.amazonaws.com/emg2pose/emg2pose_model_checkpoints.tar.gz"
+# Only find local dirs when running locally (not in Modal container)
+# Modal containers have MODAL_ENVIRONMENT set
+if os.environ.get("MODAL_ENVIRONMENT") is None:
+    LOCAL_EMG2POSE, LOCAL_SRC, LOCAL_CONFIGS = _find_local_dirs()
+else:
+    # In container - use remote paths (already mounted)
+    LOCAL_EMG2POSE = Path(REMOTE_EMG2POSE)
+    LOCAL_SRC = Path(REMOTE_SRC)
+    LOCAL_CONFIGS = Path(REMOTE_CONFIGS)
 
 # Modal app and volume
 app = modal.App("react-emg-training")
@@ -73,6 +88,7 @@ image = (
         "omegaconf==2.3.0",
         "tqdm==4.66.4",
         "matplotlib==3.9.0",
+        "joblib==1.4.2",  # Required by emg2pose
     )
     # Add local code and configs
     .add_local_dir(str(LOCAL_EMG2POSE), remote_path=REMOTE_EMG2POSE)
@@ -93,12 +109,15 @@ image = (
     memory=32768,  # 32GB RAM
 )
 def train_react_emg(
+    config_file: str = "modal_regression.yaml",
     config_overrides: dict | None = None,
     download_if_missing: bool = True,
 ):
     """Train REACT-EMG model on full dataset.
     
     Args:
+        config_file: Config filename in configs/experiment/ (default: modal_regression.yaml).
+                     Options: modal_regression.yaml, modal_tracking.yaml
         config_overrides: Dictionary of config values to override.
         download_if_missing: Download dataset if not present.
     """
@@ -115,9 +134,14 @@ def train_react_emg(
     matplotlib.use('Agg')
     
     # Load config
-    config_path = Path(REMOTE_CONFIGS) / "experiment" / "modal.yaml"
+    config_path = Path(REMOTE_CONFIGS) / "experiment" / config_file
+    print(f"Loading config: {config_path}")
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
+    
+    # Log mode
+    mode = "REGRESSION" if "regression" in config_file else "TRACKING"
+    print(f"Mode: {mode}")
     
     # Apply overrides
     if config_overrides:
@@ -128,23 +152,23 @@ def train_react_emg(
                 d = d.setdefault(k, {})
             d[keys[-1]] = value
     
-    # Extract config values
-    num_epochs = cfg["training"]["num_epochs"]
-    batch_size = cfg["training"]["batch_size"]
-    lr = cfg["training"]["optimizer"]["lr"]
-    weight_decay = cfg["training"]["optimizer"]["weight_decay"]
-    grad_clip = cfg["training"]["gradient_clip_norm"]
-    num_workers = cfg["training"]["num_workers"]
+    # Extract config values (ensure proper types)
+    num_epochs = int(cfg["training"]["num_epochs"])
+    batch_size = int(cfg["training"]["batch_size"])
+    lr = float(cfg["training"]["optimizer"]["lr"])
+    weight_decay = float(cfg["training"]["optimizer"]["weight_decay"])
+    grad_clip = float(cfg["training"]["gradient_clip_norm"])
+    num_workers = int(cfg["training"]["num_workers"])
     
-    k_min = cfg["data"]["calibration"]["k_min"]
-    k_max = cfg["data"]["calibration"]["k_max"]
+    k_min = int(cfg["data"]["calibration"]["k_min"])
+    k_max = int(cfg["data"]["calibration"]["k_max"])
     
-    feature_dim = cfg["model"]["feature_dim"]
-    user_embedding_dim = cfg["model"]["user_embedding_dim"]
-    freeze_encoder = cfg["model"]["freeze_encoder"]
+    feature_dim = int(cfg["model"]["feature_dim"])
+    user_embedding_dim = int(cfg["model"]["user_embedding_dim"])
+    freeze_encoder = bool(cfg["model"]["freeze_encoder"])
     
-    seed = cfg.get("seed", 42)
-    commit_every = cfg["output"].get("commit_every", 10)
+    seed = int(cfg.get("seed", 42))
+    commit_every = int(cfg["output"].get("commit_every", 10))
     
     train_sessions_limit = cfg["data"].get("train_sessions_limit")
     val_sessions_limit = cfg["data"].get("val_sessions_limit")
@@ -155,7 +179,8 @@ def train_react_emg(
     
     # Setup paths
     persistent_root = Path(VOLUME_MOUNT_PATH)
-    dataset_dir = persistent_root / "emg2pose_dataset"
+    # Volume contents appear directly at mount point (not under volume name)
+    dataset_dir = persistent_root / "emg2pose_data"
     checkpoints_dir = persistent_root / "emg2pose_model_checkpoints"
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -163,7 +188,7 @@ def train_react_emg(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Create symlinks for emg2pose expectations
-    home_dataset = Path("/root/emg2pose_dataset")
+    home_dataset = Path("/root/emg2pose_data")
     home_checkpoints = Path("/root/emg2pose_model_checkpoints")
     
     def ensure_symlink(target: Path, link: Path):
@@ -175,13 +200,21 @@ def train_react_emg(
                 shutil.rmtree(link)
         link.symlink_to(target)
     
-    # Download dataset if needed
+    # Check if dataset already exists (skip download)
     metadata_file = dataset_dir / "metadata.csv"
     if download_if_missing and not metadata_file.exists():
-        print("Downloading full dataset (this may take a while)...")
-        cmd = f"curl -L --retry 5 '{FULL_DATASET_URL}' | tar -xvkf - -C '{persistent_root}'"
-        subprocess.run(cmd, shell=True, check=True)
-        dataset_volume.commit()
+        # Check if data needs downloading
+        print(f"Looking for dataset at: {dataset_dir}")
+        print(f"Metadata file exists: {metadata_file.exists()}")
+        # List what's in the volume
+        print(f"Contents of {persistent_root}:")
+        if persistent_root.exists():
+            for item in persistent_root.iterdir():
+                print(f"  {item}")
+        raise FileNotFoundError(
+            f"Dataset not found at {dataset_dir}. "
+            f"Please ensure the data is uploaded to the Modal volume."
+        )
     
     if not metadata_file.exists():
         raise FileNotFoundError(f"Dataset not found at {dataset_dir}")
@@ -222,7 +255,7 @@ def train_react_emg(
         FiLMConditionedModelConfig,
         load_pretrained_encoder,
     )
-    from src.utils.data import CalibratedEmgDataset
+    from src.utils.data import create_lazy_datasets_from_metadata
     
     log("=" * 60)
     log("REACT-EMG Full Dataset Training (Modal)")
@@ -251,11 +284,15 @@ def train_react_emg(
     import pandas as pd
     metadata = pd.read_csv(metadata_file)
     
-    all_sessions = metadata["session_name"].unique().tolist()
-    log(f"Total sessions: {len(all_sessions)}")
+    # emg2pose metadata columns: session, user, filename, etc.
+    # 'filename' is the HDF5 basename (e.g., 2022-04-07-...-recording-1_left)
+    # 'session' is the session ID (shared by multiple recordings)
+    # 'user' is the user ID
+    all_filenames = metadata["filename"].unique().tolist()
+    log(f"Total files: {len(all_filenames)}")
     
     # Split by user for proper generalization
-    users = metadata["user_id"].unique().tolist()
+    users = metadata["user"].unique().tolist()
     np.random.seed(seed)
     np.random.shuffle(users)
     
@@ -266,38 +303,23 @@ def train_react_emg(
     val_users = set(users[n_train:n_train + n_val])
     test_users = set(users[n_train + n_val:])
     
-    train_sessions = metadata[metadata["user_id"].isin(train_users)]["session_name"].tolist()
-    val_sessions = metadata[metadata["user_id"].isin(val_users)]["session_name"].tolist()
-    test_sessions = metadata[metadata["user_id"].isin(test_users)]["session_name"].tolist()
+    log(f"Users: {len(train_users)} train, {len(val_users)} val, {len(test_users)} test")
     
-    # Apply session limits
-    if train_sessions_limit:
-        train_sessions = train_sessions[:train_sessions_limit]
-    if val_sessions_limit:
-        val_sessions = val_sessions[:val_sessions_limit]
-    
-    log(f"Train sessions: {len(train_sessions)} ({len(train_users)} users)")
-    log(f"Val sessions: {len(val_sessions)} ({len(val_users)} users)")
-    log(f"Test sessions: {len(test_sessions)} ({len(test_users)} users)")
-    
-    # Create datasets
-    train_dataset = CalibratedEmgDataset(
+    # Create lazy datasets from metadata (fast - no file scanning!)
+    log("Creating lazy datasets from metadata...")
+    train_dataset, val_dataset, test_dataset = create_lazy_datasets_from_metadata(
         data_dir=home_dataset,
-        session_names=train_sessions,
+        metadata_df=metadata,
+        train_users=train_users,
+        val_users=val_users,
+        test_users=test_users,
         window_length=cfg["data"]["window_length"],
         stride=cfg["data"]["stride"],
         calibration_k=k_max,
         min_calibration_k=k_min,
+        cache_size=100,  # Keep 100 sessions in memory
     )
-    
-    val_dataset = CalibratedEmgDataset(
-        data_dir=home_dataset,
-        session_names=val_sessions,
-        window_length=cfg["data"]["window_length"],
-        stride=cfg["data"]["stride"] * 2,  # Larger stride for validation
-        calibration_k=k_max,
-        min_calibration_k=k_min,
-    )
+    log("Lazy datasets created (files will be loaded on-demand)")
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -315,8 +337,8 @@ def train_react_emg(
         pin_memory=True,
     )
     
-    log(f"Train batches: {len(train_loader)}")
-    log(f"Val batches: {len(val_loader)}")
+    log(f"Train batches: {len(train_loader)} (estimated)")
+    log(f"Val batches: {len(val_loader)} (estimated)")
     
     # Load pretrained encoder
     log("\nLoading pretrained encoder...")
@@ -340,18 +362,22 @@ def train_react_emg(
     log(f"Total parameters: {num_params:,}")
     log(f"Trainable parameters: {trainable_params:,}")
     
-    # Training setup
+    # Training setup (ensure proper types for optimizer params)
+    betas = tuple(float(b) for b in cfg["training"]["optimizer"]["betas"])
+    eps = float(cfg["training"]["optimizer"]["eps"])
+    min_lr = float(cfg["training"]["scheduler"]["min_lr"])
+    
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=lr, 
         weight_decay=weight_decay,
-        betas=tuple(cfg["training"]["optimizer"]["betas"]),
-        eps=cfg["training"]["optimizer"]["eps"],
+        betas=betas,
+        eps=eps,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
         T_max=num_epochs,
-        eta_min=cfg["training"]["scheduler"]["min_lr"],
+        eta_min=min_lr,
     )
     criterion = nn.MSELoss()
     
@@ -526,6 +552,7 @@ def train_react_emg(
 
 @app.local_entrypoint()
 def main(
+    config: str = "regression",
     epochs: int = None,
     batch_size: int = None,
     lr: float = None,
@@ -533,12 +560,28 @@ def main(
 ):
     """Launch REACT-EMG training on Modal.
     
-    All parameters are optional - defaults come from configs/experiment/modal.yaml.
+    Args:
+        config: Config mode - 'regression' or 'tracking' (default: regression).
+                Maps to configs/experiment/modal_{config}.yaml
+        epochs: Override number of training epochs.
+        batch_size: Override batch size.
+        lr: Override learning rate.
+        k_max: Override max calibration samples.
     
-    Example:
+    Examples:
+        # Train with regression mode (default)
         modal run scripts/train_modal.py
-        modal run scripts/train_modal.py --epochs 50 --batch-size 16
+        
+        # Train with tracking mode
+        modal run scripts/train_modal.py --config tracking
+        
+        # Override epochs
+        modal run scripts/train_modal.py --config regression --epochs 100
     """
+    # Resolve config file
+    config_file = f"modal_{config}.yaml"
+    print(f"Using config: configs/experiment/{config_file}")
+    
     # Build config overrides from CLI args
     overrides = {}
     if epochs is not None:
@@ -551,6 +594,7 @@ def main(
         overrides["data.calibration.k_max"] = k_max
     
     result = train_react_emg.remote(
+        config_file=config_file,
         config_overrides=overrides if overrides else None,
     )
     print(f"\nTraining completed!")

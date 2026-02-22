@@ -1,16 +1,19 @@
 # Local training configuration (MPS/CPU on mini dataset)
+# Aligned with emg2pose base config settings
+#
+# Uses regression mode by default for local development
 
-# Training parameters
+# Training parameters (smaller for local testing)
 training:
   num_epochs: 50
   batch_size: 8
-  gradient_clip_norm: 1.0
+  gradient_clip_norm: 0.0  # No clipping for regression (emg2pose default)
   num_workers: 0  # 0 for macOS compatibility
   
-  # Optimizer
+  # Optimizer (emg2pose uses lr=0.001)
   optimizer:
     name: adamw
-    lr: 1e-4
+    lr: 1e-3  # emg2pose default
     weight_decay: 1e-4
     betas: [0.9, 0.999]
     eps: 1e-8
@@ -30,22 +33,34 @@ device: auto  # auto selects cuda > mps > cpu
 
 # Model configuration
 model:
-  feature_dim: 64
+  feature_dim: 64  # TDS output channels
   user_embedding_dim: 128
   freeze_encoder: true
+  # Use REGRESSION checkpoint for local dev
   pretrained_checkpoint: emg2pose_model_checkpoints/regression_vemg2pose.ckpt
+  
+  # Regression-specific (same as modal_regression.yaml)
+  provide_initial_pos: false
+  state_condition: true
 
-# Data configuration  
+# Data configuration (aligned with emg2pose)
 data:
-  # Dataset path (relative to project root)
+  # Mini dataset path (relative to project root)
   data_dir: src/data/emg2pose_dataset_mini
-  window_length: 10000
+  # emg2pose uses 11790 = 10000 + 1790 (TDS left_context)
+  window_length: 11790
+  val_test_window_length: 11790
   stride: 2000
   
-  # Calibration
+  # Calibration (smaller range for local testing)
   calibration:
     k_min: 1
     k_max: 5
+
+# Loss weights (aligned with emg2pose)
+loss_weights:
+  mae: 1.0
+  fingertip_distance: 0.01
 
 # Output settings
 output:
@@ -53,5 +68,5 @@ output:
   save_predictions: true
   plot_every: 5
 
-# Reproducibility
+# Reproducibility (emg2pose default)
 seed: 42

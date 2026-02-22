@@ -99,3 +99,6 @@ data/
 
 # Hydra outputs
 multirun/
+
+# CSV files (e.g., metadata)
+.csv

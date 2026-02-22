@@ -4,12 +4,14 @@
 Data utilities for REACT-EMG using emg2pose_dataset_mini.
 
 Wraps the emg2pose dataset with calibration sampling for user adaptation.
+Includes lazy loading support for large datasets (25k+ files).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
+from functools import lru_cache
 from pathlib import Path
 import os
 
@@ -224,6 +226,293 @@ class CalibratedEmgDataset(Dataset):
         sample["calibration_k"] = actual_k  # Actual number of valid samples (varies per item!)
         
         return sample
+
+
+class LazyCalibratedEmgDataset(Dataset):
+    """Lazy-loading EMG dataset for large datasets (25k+ files).
+    
+    Unlike CalibratedEmgDataset, this class:
+    1. Uses metadata as a manifest (doesn't scan filesystem)
+    2. Loads HDF5 files only on demand with LRU caching
+    3. Builds calibration pools lazily
+    
+    This prevents heartbeat timeouts when working with large datasets.
+    
+    Args:
+        data_dir: Path to dataset directory containing HDF5 files.
+        session_infos: List of (filename, user_id) tuples from metadata.
+        window_length: Window size in samples (default: 10000 = 5s at 2kHz).
+        stride: Stride between windows.
+        jitter: Random window offset during training.
+        skip_ik_failures: Skip windows with IK failures.
+        calibration_k: Maximum calibration samples per batch item.
+        min_calibration_k: Minimum calibration samples per batch item.
+        estimated_windows_per_session: Approximate windows per session for sizing.
+        cache_size: Number of sessions to keep in LRU cache.
+    """
+    
+    def __init__(
+        self,
+        data_dir: Path,
+        session_infos: List[Tuple[str, str]],  # (filename, user_id) tuples
+        window_length: int = 10_000,
+        stride: int = 2_000,
+        jitter: bool = False,
+        skip_ik_failures: bool = True,
+        calibration_k: int = 5,
+        min_calibration_k: int = 1,
+        estimated_windows_per_session: int = 50,  # Typical session ~100k samples
+        cache_size: int = 100,
+        validate_files: bool = False,  # Skip file existence checks for speed
+    ):
+        self.data_dir = Path(data_dir)
+        self.window_length = window_length
+        self.stride = stride
+        self.jitter = jitter
+        self.skip_ik_failures = skip_ik_failures
+        self.max_calibration_k = calibration_k
+        self.min_calibration_k = min_calibration_k
+        
+        # Build session infos - trust metadata by default (fast!)
+        # File existence is checked lazily when loading
+        self.session_infos: List[Tuple[str, str]] = []  # (filename, user_id)
+        self.user_sessions: Dict[str, List[str]] = {}  # user -> [filenames]
+        self._failed_files: set = set()  # Track files that failed to load
+        
+        for filename, user_id in session_infos:
+            if validate_files:
+                hdf5_path = self.data_dir / f"{filename}.hdf5"
+                if not hdf5_path.exists():
+                    continue
+            
+            self.session_infos.append((filename, user_id))
+            if user_id not in self.user_sessions:
+                self.user_sessions[user_id] = []
+            self.user_sessions[user_id].append(filename)
+        
+        if len(self.session_infos) == 0:
+            raise ValueError(f"No valid sessions found (got {len(session_infos)} from metadata)")
+        
+        print(f"LazyCalibratedEmgDataset: {len(self.session_infos)} sessions, "
+              f"{len(self.user_sessions)} users")
+        
+        # Build index mapping: global_idx -> (session_idx, local_window_idx)
+        # We estimate windows per session to avoid opening files
+        self.estimated_windows = estimated_windows_per_session
+        self._total_samples = len(self.session_infos) * self.estimated_windows
+        
+        # Setup LRU cache for session loading
+        self._cache_size = cache_size
+        self._session_cache: Dict[str, WindowedEmgDataset] = {}
+        self._cache_order: List[str] = []  # LRU order
+        
+        # Calibration pool: lazily populated per user
+        self._calibration_pools: Dict[str, List[torch.Tensor]] = {}
+    
+    def _get_session_dataset(self, filename: str) -> WindowedEmgDataset:
+        """Get or create WindowedEmgDataset for a session (with LRU caching)."""
+        if filename in self._failed_files:
+            raise FileNotFoundError(f"Previously failed: {filename}")
+        
+        if filename in self._session_cache:
+            # Move to end of LRU order
+            self._cache_order.remove(filename)
+            self._cache_order.append(filename)
+            return self._session_cache[filename]
+        
+        # Load new session
+        hdf5_path = self.data_dir / f"{filename}.hdf5"
+        
+        if not hdf5_path.exists():
+            self._failed_files.add(filename)
+            raise FileNotFoundError(f"File not found: {hdf5_path}")
+        
+        dataset = WindowedEmgDataset(
+            hdf5_path=hdf5_path,
+            window_length=self.window_length,
+            stride=self.stride,
+            jitter=self.jitter,
+            skip_ik_failures=self.skip_ik_failures,
+        )
+        
+        # Add to cache
+        self._session_cache[filename] = dataset
+        self._cache_order.append(filename)
+        
+        # Evict oldest if cache full
+        while len(self._cache_order) > self._cache_size:
+            oldest = self._cache_order.pop(0)
+            del self._session_cache[oldest]
+        
+        return dataset
+    
+    def _get_calibration_samples(self, user_id: str, k: int) -> List[torch.Tensor]:
+        """Get k calibration samples for a user (lazy loading)."""
+        if user_id not in self._calibration_pools:
+            # Build calibration pool lazily
+            pool = []
+            user_sessions = self.user_sessions.get(user_id, [])
+            
+            # Sample from a few sessions for this user
+            sample_sessions = user_sessions[:5] if len(user_sessions) > 5 else user_sessions
+            
+            for sess_filename in sample_sessions:
+                try:
+                    dataset = self._get_session_dataset(sess_filename)
+                    if len(dataset) > 0:
+                        idx = np.random.randint(0, len(dataset))
+                        sample = dataset[idx]
+                        pool.append(sample["emg"])
+                except Exception:
+                    continue
+            
+            self._calibration_pools[user_id] = pool
+        
+        pool = self._calibration_pools[user_id]
+        if len(pool) == 0:
+            return []
+        
+        if len(pool) >= k:
+            indices = np.random.choice(len(pool), k, replace=False)
+            return [pool[i] for i in indices]
+        else:
+            # Repeat with replacement if pool too small
+            indices = np.random.choice(len(pool), k, replace=True)
+            return [pool[i] for i in indices]
+    
+    def __len__(self) -> int:
+        return self._total_samples
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        # Map global index to session
+        session_idx = idx // self.estimated_windows
+        local_idx = idx % self.estimated_windows
+        
+        # Handle wraparound if idx > actual samples
+        session_idx = session_idx % len(self.session_infos)
+        
+        filename, user_id = self.session_infos[session_idx]
+        
+        try:
+            dataset = self._get_session_dataset(filename)
+            
+            # Handle local_idx overflow
+            if local_idx >= len(dataset):
+                local_idx = local_idx % max(1, len(dataset))
+            
+            sample = dataset[local_idx]
+        except Exception as e:
+            # Fallback: return zeros if file can't be loaded
+            print(f"Warning: Failed to load {filename}: {e}")
+            sample = {
+                "emg": torch.zeros(16, self.window_length),
+                "joint_angles": torch.zeros(20, self.window_length),
+                "no_ik_failure": torch.ones(self.window_length, dtype=torch.bool),
+            }
+        
+        sample["user_id"] = user_id
+        sample["session_name"] = filename
+        
+        # Sample calibration data with variable K
+        max_k = self.max_calibration_k
+        min_k = self.min_calibration_k
+        actual_k = np.random.randint(min_k, max_k + 1)
+        
+        cal_samples = self._get_calibration_samples(user_id, actual_k)
+        
+        # Pad to max_k for batching
+        emg_shape = sample["emg"].shape
+        padded_calibration = torch.zeros(self.max_calibration_k, *emg_shape)
+        
+        for i, cal_emg in enumerate(cal_samples):
+            if i < self.max_calibration_k:
+                padded_calibration[i] = cal_emg
+        
+        sample["calibration_emg"] = padded_calibration
+        sample["calibration_k"] = actual_k
+        
+        return sample
+
+
+def create_lazy_datasets_from_metadata(
+    data_dir: Path,
+    metadata_df: "pd.DataFrame",  # pandas DataFrame with 'filename' and 'user' columns
+    train_users: set,
+    val_users: set,
+    test_users: set,
+    window_length: int = 10_000,
+    stride: int = 2_000,
+    calibration_k: int = 5,
+    min_calibration_k: int = 1,
+    cache_size: int = 100,
+) -> Tuple["LazyCalibratedEmgDataset", "LazyCalibratedEmgDataset", "LazyCalibratedEmgDataset"]:
+    """Create lazy train/val/test datasets from metadata DataFrame.
+    
+    This is the recommended way to create datasets for large (25k+ files) datasets.
+    Uses metadata.csv as a manifest instead of scanning the filesystem.
+    
+    Args:
+        data_dir: Path to directory containing HDF5 files.
+        metadata_df: pandas DataFrame with 'filename' and 'user' columns.
+        train_users: Set of user IDs for training.
+        val_users: Set of user IDs for validation.
+        test_users: Set of user IDs for testing.
+        window_length: Window size in samples.
+        stride: Stride between windows.
+        calibration_k: Maximum calibration samples.
+        min_calibration_k: Minimum calibration samples.
+        cache_size: LRU cache size for session datasets.
+    
+    Returns:
+        Tuple of (train_dataset, val_dataset, test_dataset).
+    """
+    def get_session_infos(users: set) -> List[Tuple[str, str]]:
+        filtered = metadata_df[metadata_df["user"].isin(users)]
+        return [(row["filename"], row["user"]) for _, row in filtered.iterrows()]
+    
+    train_infos = get_session_infos(train_users)
+    val_infos = get_session_infos(val_users)
+    test_infos = get_session_infos(test_users)
+    
+    print(f"Creating lazy datasets: train={len(train_infos)}, val={len(val_infos)}, test={len(test_infos)}")
+    
+    train_dataset = LazyCalibratedEmgDataset(
+        data_dir=data_dir,
+        session_infos=train_infos,
+        window_length=window_length,
+        stride=stride,
+        jitter=True,
+        calibration_k=calibration_k,
+        min_calibration_k=min_calibration_k,
+        cache_size=cache_size,
+        validate_files=False,  # Trust metadata, check lazily
+    )
+    
+    val_dataset = LazyCalibratedEmgDataset(
+        data_dir=data_dir,
+        session_infos=val_infos,
+        window_length=window_length,
+        stride=stride * 2,  # Larger stride for validation
+        jitter=False,
+        calibration_k=calibration_k,
+        min_calibration_k=min_calibration_k,
+        cache_size=cache_size // 2,
+        validate_files=False,
+    )
+    
+    test_dataset = LazyCalibratedEmgDataset(
+        data_dir=data_dir,
+        session_infos=test_infos,
+        window_length=window_length,
+        stride=stride * 2,
+        jitter=False,
+        calibration_k=calibration_k,
+        min_calibration_k=min_calibration_k,
+        cache_size=cache_size // 2,
+        validate_files=False,
+    )
+    
+    return train_dataset, val_dataset, test_dataset
 
 
 def create_dataloaders(
