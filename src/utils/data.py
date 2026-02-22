@@ -346,39 +346,60 @@ class LazyCalibratedEmgDataset(Dataset):
         
         return dataset
     
-    def _get_calibration_samples(self, user_id: str, k: int) -> List[torch.Tensor]:
-        """Get k calibration samples for a user (lazy loading)."""
-        if user_id not in self._calibration_pools:
-            # Build calibration pool lazily
-            pool = []
-            user_sessions = self.user_sessions.get(user_id, [])
-            
-            # Sample from a few sessions for this user
-            sample_sessions = user_sessions[:5] if len(user_sessions) > 5 else user_sessions
-            
-            for sess_filename in sample_sessions:
-                try:
-                    dataset = self._get_session_dataset(sess_filename)
-                    if len(dataset) > 0:
-                        idx = np.random.randint(0, len(dataset))
-                        sample = dataset[idx]
-                        pool.append(sample["emg"])
-                except Exception:
-                    continue
-            
-            self._calibration_pools[user_id] = pool
+    def _load_full_recording(self, filename: str) -> torch.Tensor:
+        """Load full EMG recording (not windowed) for calibration.
         
-        pool = self._calibration_pools[user_id]
-        if len(pool) == 0:
+        Returns:
+            EMG tensor of shape (16, L) where L is full recording length.
+        """
+        hdf5_path = self.data_dir / f"{filename}.hdf5"
+        
+        if not hdf5_path.exists():
+            raise FileNotFoundError(f"File not found: {hdf5_path}")
+        
+        try:
+            # Load full recording directly from HDF5
+            session = Emg2PoseSessionData(hdf5_path)
+            emg = session.timeseries[Emg2PoseSessionData.EMG]  # Shape: (T, 16)
+            
+            if len(emg) == 0:
+                raise ValueError("Empty EMG recording")
+            
+            emg_tensor = torch.as_tensor(emg, dtype=torch.float32).T  # Shape: (16, T)
+            return emg_tensor
+        except Exception as e:
+            raise RuntimeError(f"Failed to load {filename}: {e}")
+    
+    def _get_calibration_recordings(self, user_id: str, k: int) -> List[torch.Tensor]:
+        """Get k FULL calibration recordings for a user (variable lengths).
+        
+        Each recording is the entire EMG sequence, not windowed.
+        
+        Returns:
+            List of k tensors, each with shape (16, Li) where Li varies.
+        """
+        user_sessions = self.user_sessions.get(user_id, [])
+        
+        if len(user_sessions) == 0:
             return []
         
-        if len(pool) >= k:
-            indices = np.random.choice(len(pool), k, replace=False)
-            return [pool[i] for i in indices]
+        # Select k sessions (or fewer if not enough)
+        if len(user_sessions) >= k:
+            selected = np.random.choice(user_sessions, k, replace=False).tolist()
         else:
-            # Repeat with replacement if pool too small
-            indices = np.random.choice(len(pool), k, replace=True)
-            return [pool[i] for i in indices]
+            # Use what we have, potentially repeat
+            selected = np.random.choice(user_sessions, k, replace=True).tolist()
+        
+        recordings = []
+        for sess_filename in selected:
+            try:
+                emg = self._load_full_recording(sess_filename)
+                recordings.append(emg)
+            except Exception as e:
+                # Skip failed recordings
+                continue
+        
+        return recordings
     
     def __len__(self) -> int:
         return self._total_samples
@@ -413,25 +434,45 @@ class LazyCalibratedEmgDataset(Dataset):
         sample["user_id"] = user_id
         sample["session_name"] = filename
         
-        # Sample calibration data with variable K
+        # Sample K full calibration recordings (variable lengths!)
         max_k = self.max_calibration_k
         min_k = self.min_calibration_k
-        actual_k = np.random.randint(min_k, max_k + 1)
+        actual_k = np.random.randint(min_k, max_k + 1) if max_k > min_k else max_k
         
-        cal_samples = self._get_calibration_samples(user_id, actual_k)
+        # Get full recordings (list of variable-length tensors)
+        cal_recordings = self._get_calibration_recordings(user_id, actual_k)
         
-        # Pad to max_k for batching
-        emg_shape = sample["emg"].shape
-        padded_calibration = torch.zeros(self.max_calibration_k, *emg_shape)
-        
-        for i, cal_emg in enumerate(cal_samples):
-            if i < self.max_calibration_k:
-                padded_calibration[i] = cal_emg
-        
-        sample["calibration_emg"] = padded_calibration
-        sample["calibration_k"] = actual_k
+        # Store as list (can't pad variable lengths into single tensor)
+        sample["calibration_recordings"] = cal_recordings  # List of (16, Li) tensors
+        sample["calibration_k"] = len(cal_recordings)  # Actual number retrieved
         
         return sample
+
+
+def collate_with_variable_calibration(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Custom collate function for batches with variable-length calibration recordings.
+    
+    Standard fields (emg, joint_angles, etc.) are stacked normally.
+    calibration_recordings stays as a list of lists (one per batch item).
+    """
+    # Standard collation for fixed-size tensors
+    emg = torch.stack([item["emg"] for item in batch])
+    joint_angles = torch.stack([item["joint_angles"] for item in batch])
+    no_ik_failure = torch.stack([item["no_ik_failure"] for item in batch])
+    calibration_k = torch.tensor([item["calibration_k"] for item in batch])
+    
+    # Keep calibration recordings as list of lists (variable lengths)
+    calibration_recordings = [item["calibration_recordings"] for item in batch]
+    
+    return {
+        "emg": emg,
+        "joint_angles": joint_angles,
+        "no_ik_failure": no_ik_failure,
+        "calibration_recordings": calibration_recordings,  # List[List[Tensor]]
+        "calibration_k": calibration_k,
+        "user_id": [item["user_id"] for item in batch],
+        "session_name": [item["session_name"] for item in batch],
+    }
 
 
 def create_lazy_datasets_from_metadata(

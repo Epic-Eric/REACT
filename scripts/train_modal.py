@@ -98,6 +98,41 @@ image = (
 
 
 # =============================================================================
+# Collate Function (defined at module level for multiprocessing pickle)
+# =============================================================================
+
+def collate_with_variable_calibration(batch):
+    """Custom collate function for batches with variable-length calibration recordings.
+    
+    This must be defined at module level (not imported from a custom path) so that
+    DataLoader workers can pickle/unpickle it properly.
+    
+    Standard fields (emg, joint_angles, etc.) are stacked normally.
+    calibration_recordings stays as a list of lists (one per batch item).
+    """
+    import torch
+    
+    # Standard collation for fixed-size tensors
+    emg = torch.stack([item["emg"] for item in batch])
+    joint_angles = torch.stack([item["joint_angles"] for item in batch])
+    no_ik_failure = torch.stack([item["no_ik_failure"] for item in batch])
+    calibration_k = torch.tensor([item["calibration_k"] for item in batch])
+    
+    # Keep calibration recordings as list of lists (variable lengths)
+    calibration_recordings = [item["calibration_recordings"] for item in batch]
+    
+    return {
+        "emg": emg,
+        "joint_angles": joint_angles,
+        "no_ik_failure": no_ik_failure,
+        "calibration_recordings": calibration_recordings,  # List[List[Tensor]]
+        "calibration_k": calibration_k,
+        "user_id": [item["user_id"] for item in batch],
+        "session_name": [item["session_name"] for item in batch],
+    }
+
+
+# =============================================================================
 # Training Function
 # =============================================================================
 
@@ -321,12 +356,14 @@ def train_react_emg(
     )
     log("Lazy datasets created (files will be loaded on-demand)")
     
+    # collate_with_variable_calibration is defined at module level for multiprocessing
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=collate_with_variable_calibration,
     )
     
     val_loader = torch.utils.data.DataLoader(
@@ -335,6 +372,7 @@ def train_react_emg(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=collate_with_variable_calibration,
     )
     
     log(f"Train batches: {len(train_loader)} (estimated)")
@@ -400,16 +438,14 @@ def train_react_emg(
         for batch_idx, batch in enumerate(train_loader):
             emg = batch["emg"].to(device)
             targets = batch["joint_angles"].to(device)
-            calibration_emg = batch["calibration_emg"].to(device)
-            num_cal_samples = batch["calibration_k"].to(device)
+            calibration_recordings = batch["calibration_recordings"]  # List[List[Tensor]]
             
             optimizer.zero_grad()
             
             try:
-                predictions = model.forward_with_raw_calibration(
+                predictions = model.forward_with_full_recordings(
                     emg=emg,
-                    calibration_emg=calibration_emg,
-                    num_calibration_samples=num_cal_samples,
+                    calibration_recordings=calibration_recordings,
                 )
                 
                 # Handle length mismatch
@@ -441,14 +477,12 @@ def train_react_emg(
             for batch in val_loader:
                 emg = batch["emg"].to(device)
                 targets = batch["joint_angles"].to(device)
-                calibration_emg = batch["calibration_emg"].to(device)
-                num_cal_samples = batch["calibration_k"].to(device)
+                calibration_recordings = batch["calibration_recordings"]  # List[List[Tensor]]
                 
                 try:
-                    predictions = model.forward_with_raw_calibration(
+                    predictions = model.forward_with_full_recordings(
                         emg=emg,
-                        calibration_emg=calibration_emg,
-                        num_calibration_samples=num_cal_samples,
+                        calibration_recordings=calibration_recordings,
                     )
                     
                     pred_len = predictions.shape[-1]

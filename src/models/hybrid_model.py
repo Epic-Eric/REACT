@@ -15,7 +15,7 @@ This enables user-adaptive pose prediction through learned calibration.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from pathlib import Path
 
 import torch
@@ -332,6 +332,94 @@ class FiLMConditionedModel(nn.Module):
         user_embeddings = self.user_encoder.forward_padded(
             cal_features, num_calibration_samples, cal_lengths_adj
         )
+        
+        # Apply FiLM conditioning
+        conditioned_features = self.film_layer(features, user_embeddings)
+        
+        # Predict poses
+        return self.prediction_head(conditioned_features)
+    
+    def forward_with_full_recordings(
+        self,
+        emg: torch.Tensor,
+        calibration_recordings: List[List[torch.Tensor]],
+    ) -> torch.Tensor:
+        """Forward pass with variable-length FULL calibration recordings.
+        
+        This is the proper way to use calibration data - each recording
+        is the full EMG sequence (not windowed).
+        
+        Args:
+            emg: Raw EMG of shape (B, 16, L) - the main recording windows.
+            calibration_recordings: List of B items, each is a list of K_i tensors
+                                   of shape (16, L_i) with variable L_i.
+        
+        Returns:
+            Pose predictions of shape (B, out_channels, L').
+        """
+        B = emg.shape[0]
+        device = emg.device
+        
+        # Encode main recording
+        features = self.encode(emg)  # (B, C, L')
+        
+        # Process each batch item's calibration recordings separately
+        user_embeddings_list = []
+        
+        for batch_idx in range(B):
+            recordings = calibration_recordings[batch_idx]
+            
+            if len(recordings) == 0:
+                # No calibration data - use zero embedding
+                user_embed = torch.zeros(
+                    self.config.user_embedding_dim, device=device
+                )
+            else:
+                # Encode each full recording and pool
+                recording_embeddings = []
+                
+                for rec in recordings:
+                    try:
+                        # rec shape: (16, L_i) - variable length
+                        rec_batch = rec.unsqueeze(0).to(device)  # (1, 16, L_i)
+                        
+                        # Encode with pretrained encoder
+                        rec_features = self.encode(rec_batch)  # (1, C, L_i')
+                        
+                        # Process through characteristic CNN
+                        char_features = self.user_encoder.characteristic_cnn(
+                            rec_features
+                        )  # (1, C, L_i')
+                        
+                        # Pool via temporal attention to get fixed-size vector
+                        pooled = self.user_encoder.attention_pooling(
+                            char_features
+                        )  # (1, C)
+                        
+                        recording_embeddings.append(pooled.squeeze(0))  # (C,)
+                    except Exception:
+                        # Skip recordings that fail to encode
+                        continue
+                
+                # Handle case where all recordings failed to encode
+                if len(recording_embeddings) == 0:
+                    user_embed = torch.zeros(
+                        self.config.user_embedding_dim, device=device
+                    )
+                else:
+                    # Stack K recording embeddings
+                    stacked = torch.stack(recording_embeddings, dim=0)  # (K, C)
+                    stacked = stacked.unsqueeze(0)  # (1, K, C)
+                    
+                    # Aggregate with transformer group encoder (no mask needed)
+                    user_embed = self.user_encoder.group_encoder(
+                        stacked
+                    ).squeeze(0)  # (user_embedding_dim,)
+            
+            user_embeddings_list.append(user_embed)
+        
+        # Stack all user embeddings
+        user_embeddings = torch.stack(user_embeddings_list, dim=0)  # (B, embed_dim)
         
         # Apply FiLM conditioning
         conditioned_features = self.film_layer(features, user_embeddings)
