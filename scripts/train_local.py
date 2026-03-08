@@ -257,7 +257,8 @@ def main():
                 loss = compute_loss_with_length_match(predictions, targets, criterion)
                 loss.backward()
                 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
                 epoch_losses.append(loss.item())
                 
@@ -383,6 +384,151 @@ def main():
         output_dir / "history.json",
         train_losses, val_losses, best_val_loss, best_epoch, total_time, cfg,
     )
+    
+    # =================================================================
+    # Evaluation (emg2pose-style metrics on train, val, test)
+    # =================================================================
+    logger.log("\n" + "=" * 60)
+    logger.log("Running emg2pose-style evaluation...")
+    logger.log("=" * 60)
+    
+    # Load best model for eval
+    best_ckpt = torch.load(output_dir / "best_model.pt", map_location=device)
+    model.load_state_dict(best_ckpt["model_state_dict"])
+    model.eval()
+    logger.log(f"Loaded best model from epoch {best_ckpt['epoch'] + 1}")
+    
+    from emg2pose.constants import JOINTS, NUM_JOINTS, LANDMARKS, NO_MOVEMENT_LANDMARKS
+    from emg2pose.kinematics import forward_kinematics, load_default_hand_model, TorchHandModel
+    
+    hand_model = TorchHandModel(load_default_hand_model())
+    
+    def evaluate_loader(loader, split_name):
+        """Evaluate on a loader using emg2pose AngleMAE metric."""
+        all_preds = []
+        all_targets = []
+        all_masks = []
+        
+        with torch.no_grad():
+            for batch in loader:
+                emg = batch["emg"].to(device)
+                targets = batch["joint_angles"].to(device)
+                calibration_emg = batch["calibration_emg"].to(device)
+                num_cal_samples = batch["calibration_k"].to(device)
+                
+                predictions = model.forward_with_raw_calibration(
+                    emg=emg,
+                    calibration_emg=calibration_emg,
+                    num_calibration_samples=num_cal_samples,
+                )
+                
+                # Align lengths
+                min_len = min(predictions.shape[-1], targets.shape[-1])
+                pred = predictions[..., :min_len]
+                tgt = targets[..., :min_len]
+                
+                # IK failure mask
+                if "no_ik_failure" in batch:
+                    mask = batch["no_ik_failure"].to(device)[..., :min_len]
+                else:
+                    mask = torch.ones(tgt.shape[0], min_len, dtype=torch.bool, device=device)
+                
+                all_preds.append(pred.cpu())
+                all_targets.append(tgt.cpu())
+                all_masks.append(mask.cpu())
+        
+        preds = torch.cat(all_preds, dim=0)     # (N, 20, L)
+        targets = torch.cat(all_targets, dim=0)  # (N, 20, L)
+        masks = torch.cat(all_masks, dim=0)       # (N, L)
+        
+        # AngleMAE (same as emg2pose AngleMAE metric)
+        mask_exp = masks.unsqueeze(1).expand_as(preds)  # (N, 20, L)
+        overall_mae = torch.nn.L1Loss()(preds[mask_exp], targets[mask_exp]).item()
+        
+        # MSE
+        overall_mse = torch.nn.MSELoss()(preds[mask_exp], targets[mask_exp]).item()
+        
+        # Per-joint MAE
+        per_joint_mae = {}
+        for j in JOINTS:
+            j_mask = masks  # (N, L)
+            j_pred = preds[:, j.index]  # (N, L)
+            j_tgt = targets[:, j.index]
+            if j_mask.any():
+                per_joint_mae[j.name] = torch.nn.L1Loss()(j_pred[j_mask], j_tgt[j_mask]).item()
+        
+        # Per-finger MAE
+        fingers = {"thumb": [], "index": [], "middle": [], "ring": [], "pinky": []}
+        for j in JOINTS:
+            for finger in fingers:
+                if finger in j.groups:
+                    fingers[finger].append(j.index)
+        per_finger_mae = {}
+        for finger, idxs in fingers.items():
+            f_mask = masks.unsqueeze(1).expand(-1, len(idxs), -1)
+            f_pred = preds[:, idxs]
+            f_tgt = targets[:, idxs]
+            if f_mask.any():
+                per_finger_mae[finger] = torch.nn.L1Loss()(f_pred[f_mask], f_tgt[f_mask]).item()
+        
+        # Landmark / fingertip distances (same as emg2pose LandmarkDistances metric)
+        # Downsample by 40x to avoid OOM in forward_kinematics (same as emg2pose)
+        ds = 40
+        sl = slice(None, None, ds)
+        eval_device = torch.device("cpu")  # FK can be memory-heavy
+        
+        if hand_model.device != eval_device:
+            hand_model.to(eval_device)
+        
+        pred_pos = forward_kinematics(preds[:, :, sl].to(eval_device), hand_model)
+        tgt_pos = forward_kinematics(targets[:, :, sl].to(eval_device), hand_model)
+        mask_sl = masks[:, sl].to(eval_device)
+        
+        # Fingertip distance
+        ft_idxs = [lm.index for lm in LANDMARKS if "fingertip" in lm.groups]
+        ft_mask = mask_sl[..., None].expand(-1, -1, len(ft_idxs))
+        fingertip_dist = torch.linalg.norm(
+            pred_pos[:, :, ft_idxs] - tgt_pos[:, :, ft_idxs], dim=-1
+        )[ft_mask].mean().item()
+        
+        # Landmark distance (all moving landmarks)
+        lm_idxs = [lm.index for lm in LANDMARKS if lm.name not in NO_MOVEMENT_LANDMARKS]
+        lm_mask = mask_sl[..., None].expand(-1, -1, len(lm_idxs))
+        landmark_dist = torch.linalg.norm(
+            pred_pos[:, :, lm_idxs] - tgt_pos[:, :, lm_idxs], dim=-1
+        )[lm_mask].mean().item()
+        
+        # Print results (FK outputs in mm since hand model is in mm)
+        logger.log(f"\n--- {split_name} ---")
+        logger.log(f"  Samples: {preds.shape[0]}")
+        logger.log(f"  AngleMAE:           {overall_mae:.6f} rad  ({np.degrees(overall_mae):.4f} deg)")
+        logger.log(f"  MSE:                {overall_mse:.6f}")
+        logger.log(f"  RMSE:               {np.sqrt(overall_mse):.6f} rad  ({np.degrees(np.sqrt(overall_mse)):.4f} deg)")
+        logger.log(f"  Fingertip distance: {fingertip_dist:.2f} mm")
+        logger.log(f"  Landmark distance:  {landmark_dist:.2f} mm")
+        
+        logger.log(f"  Per-finger MAE (deg):")
+        for finger, mae in per_finger_mae.items():
+            logger.log(f"    {finger:10s}: {np.degrees(mae):.4f}")
+        
+        logger.log(f"  Per-joint MAE (deg):")
+        for name, mae in per_joint_mae.items():
+            logger.log(f"    {name:25s}: {np.degrees(mae):.4f}")
+        
+        return {"mae": overall_mae, "mae_deg": np.degrees(overall_mae), "mse": overall_mse,
+                "fingertip_mm": fingertip_dist, "landmark_mm": landmark_dist}
+    
+    train_metrics = evaluate_loader(train_loader, "TRAIN")
+    val_metrics = evaluate_loader(val_loader, "VAL")
+    test_metrics = evaluate_loader(test_loader, "TEST")
+    
+    logger.log(f"\n{'='*60}")
+    logger.log(f"Summary:")
+    logger.log(f"  {'':10s} {'MAE (deg)':>10s} {'Fingertip':>12s} {'Landmark':>12s}")
+    logger.log(f"  {'Train':10s} {train_metrics['mae_deg']:10.4f} {train_metrics['fingertip_mm']:10.2f} mm {train_metrics['landmark_mm']:10.2f} mm")
+    logger.log(f"  {'Val':10s} {val_metrics['mae_deg']:10.4f} {val_metrics['fingertip_mm']:10.2f} mm {val_metrics['landmark_mm']:10.2f} mm")
+    logger.log(f"  {'Test':10s} {test_metrics['mae_deg']:10.4f} {test_metrics['fingertip_mm']:10.2f} mm {test_metrics['landmark_mm']:10.2f} mm")
+    logger.log(f"{'='*60}")
     
     logger.log(f"\nAll outputs saved to: {output_dir}")
     logger.log("Files:")

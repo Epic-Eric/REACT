@@ -90,6 +90,7 @@ image = (
         "matplotlib==3.9.0",
         "joblib==1.4.2",  # Required by emg2pose
     )
+    .dockerfile_commands(["RUN chmod 1777 /dev/shm"])
     # Add local code and configs
     .add_local_dir(str(LOCAL_EMG2POSE), remote_path=REMOTE_EMG2POSE)
     .add_local_dir(str(LOCAL_SRC), remote_path=REMOTE_SRC)
@@ -101,35 +102,42 @@ image = (
 # Collate Function (defined at module level for multiprocessing pickle)
 # =============================================================================
 
-def collate_with_variable_calibration(batch):
-    """Custom collate function for batches with variable-length calibration recordings.
-    
-    This must be defined at module level (not imported from a custom path) so that
-    DataLoader workers can pickle/unpickle it properly.
-    
-    Standard fields (emg, joint_angles, etc.) are stacked normally.
-    calibration_recordings stays as a list of lists (one per batch item).
+def collate_calibrated_batch(batch):
+    """Collate function for PrebuiltCalibratedDataset.
+
+    Must be at module level so DataLoader workers can pickle it.
+
+    Each item carries max_k calibration windows with no padding.  A single
+    random k is sampled here for the whole batch and the calibration tensor is
+    sliced to shape (B, k, 16, L).  Every sample in the batch uses exactly k
+    calibration windows — no wasted encoder compute on padding, no masking.
     """
+    import numpy as np
     import torch
     
-    # Standard collation for fixed-size tensors
     emg = torch.stack([item["emg"] for item in batch])
     joint_angles = torch.stack([item["joint_angles"] for item in batch])
     no_ik_failure = torch.stack([item["no_ik_failure"] for item in batch])
-    calibration_k = torch.tensor([item["calibration_k"] for item in batch])
-    
-    # Keep calibration recordings as list of lists (variable lengths)
-    calibration_recordings = [item["calibration_recordings"] for item in batch]
-    
+    calibration_emg = torch.stack([item["calibration_emg"] for item in batch])  # (B, max_k, 16, L)
+
+    # One k for the whole iteration — eliminates padding entirely.
+    max_k = calibration_emg.shape[1]
+    k = int(np.random.randint(1, max_k + 1)) if max_k > 1 else max_k
+    calibration_emg = calibration_emg[:, :k, :, :]  # (B, k, 16, L)
+
     return {
-        "emg": emg,
-        "joint_angles": joint_angles,
-        "no_ik_failure": no_ik_failure,
-        "calibration_recordings": calibration_recordings,  # List[List[Tensor]]
-        "calibration_k": calibration_k,
+        "emg": emg,  # (B, 16, L)
+        "joint_angles": joint_angles,  # (B, 20, L)
+        "no_ik_failure": no_ik_failure,  # (B, L)
+        "calibration_emg": calibration_emg,  # (B, k, 16, L)
+        "calibration_k": torch.full((len(batch),), k, dtype=torch.long),  # (B,) all equal k
         "user_id": [item["user_id"] for item in batch],
         "session_name": [item["session_name"] for item in batch],
     }
+
+
+# Keep old name as alias for backwards compatibility
+collate_with_variable_calibration = collate_calibrated_batch
 
 
 # =============================================================================
@@ -139,9 +147,69 @@ def collate_with_variable_calibration(batch):
 @app.function(
     image=image,
     volumes={VOLUME_MOUNT_PATH: dataset_volume},
-    gpu="A10G",  # Can be overridden by config
+    timeout=60 * 60,  # 1 hour for validation
+    cpu=10,
+)
+def precompute_dataset_cache(
+    window_length: int = 11790,
+    stride: int = 2000,
+    num_workers: int = 10,
+):
+    """Pre-validate all sessions and save cache to persistent volume.
+    
+    Run this ONCE before training to avoid the ~5-min validation step:
+        modal run scripts/train_modal.py::precompute_cache
+    
+    The cache is stored at /persistent/dataset_cache/ and will be
+    reused automatically by train_react_emg on subsequent runs.
+    """
+    import shutil
+    import pandas as pd
+    import subprocess
+
+    persistent_root = Path(VOLUME_MOUNT_PATH)
+    dataset_dir = persistent_root / "emg2pose_data"
+    metadata_file = dataset_dir / "metadata.csv"
+    cache_dir = persistent_root / "dataset_cache"
+
+    # Symlink for emg2pose
+    home_dataset = Path("/root/emg2pose_data")
+    if not home_dataset.exists():
+        home_dataset.symlink_to(dataset_dir)
+
+    if not metadata_file.exists():
+        raise FileNotFoundError(f"Dataset metadata not found at {metadata_file}")
+
+    sys.path.insert(0, REMOTE_EMG2POSE)
+    sys.path.insert(0, "/root")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-e", REMOTE_EMG2POSE], check=True)
+
+    from src.utils.data import precompute_dataset_cache as _precompute
+
+    metadata = pd.read_csv(metadata_file)
+    print(f"Total files in metadata: {len(metadata)}")
+
+    _precompute(
+        data_dir=home_dataset,
+        metadata_df=metadata,
+        cache_dir=cache_dir,
+        window_length=window_length,
+        stride=stride,
+        num_workers=num_workers,
+    )
+
+    dataset_volume.commit()
+    print(f"\nCache saved to {cache_dir} and committed to volume.")
+    print("Subsequent training runs will skip validation automatically.")
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_MOUNT_PATH: dataset_volume},
+    gpu="A10G", 
     timeout=60 * 60 * 12,  # 12 hours max
-    memory=32768,  # 32GB RAM
+    cpu=10,
+    memory=262144,  # 256GB RAM
 )
 def train_react_emg(
     config_file: str = "modal_regression.yaml",
@@ -166,7 +234,14 @@ def train_react_emg(
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib
+    import subprocess
     matplotlib.use('Agg')
+
+    try:
+        shm_info = subprocess.check_output(['df', '-h', '/dev/shm']).decode()
+        print(f"--- Shared Memory Status ---\n{shm_info}---------------------------")
+    except Exception as e:
+        print(f"Could not check /dev/shm: {e}")
     
     # Load config
     config_path = Path(REMOTE_CONFIGS) / "experiment" / config_file
@@ -315,6 +390,11 @@ def train_react_emg(
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    # Dataset cache directory on the persistent volume
+    cache_dir = persistent_root / "dataset_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Dataset cache dir: {cache_dir}")
+    
     # Load metadata and create splits
     import pandas as pd
     metadata = pd.read_csv(metadata_file)
@@ -340,8 +420,8 @@ def train_react_emg(
     
     log(f"Users: {len(train_users)} train, {len(val_users)} val, {len(test_users)} test")
     
-    # Create lazy datasets from metadata (fast - no file scanning!)
-    log("Creating lazy datasets from metadata...")
+    # Create datasets from metadata with parallel validation
+    log("Building datasets with parallel workers...")
     train_dataset, val_dataset, test_dataset = create_lazy_datasets_from_metadata(
         data_dir=home_dataset,
         metadata_df=metadata,
@@ -352,18 +432,21 @@ def train_react_emg(
         stride=cfg["data"]["stride"],
         calibration_k=k_max,
         min_calibration_k=k_min,
-        cache_size=100,  # Keep 100 sessions in memory
+        num_workers=num_workers,  # Parallel workers for faster loading
+        cache_dir=cache_dir,  # Use persistent cache
     )
-    log("Lazy datasets created (files will be loaded on-demand)")
+    log("Datasets built successfully (all sessions pre-validated)")
     
-    # collate_with_variable_calibration is defined at module level for multiprocessing
+    # collate_calibrated_batch is defined at module level for multiprocessing
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=collate_with_variable_calibration,
+        collate_fn=collate_calibrated_batch,
+        prefetch_factor=8,  # Prefetch batches for smoother training
+        persistent_workers=True,  # Keep workers alive across epochs
     )
     
     val_loader = torch.utils.data.DataLoader(
@@ -372,11 +455,13 @@ def train_react_emg(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=collate_with_variable_calibration,
+        collate_fn=collate_calibrated_batch,
+        prefetch_factor=8,  # Prefetch batches for smoother training
+        persistent_workers=True,  # Keep workers alive across epochs
     )
     
-    log(f"Train batches: {len(train_loader)} (estimated)")
-    log(f"Val batches: {len(val_loader)} (estimated)")
+    log(f"Train batches: {len(train_loader)}")
+    log(f"Val batches: {len(val_loader)}")
     
     # Load pretrained encoder
     log("\nLoading pretrained encoder...")
@@ -434,18 +519,24 @@ def train_react_emg(
         # Train
         model.train()
         epoch_losses = []
-        
+        data_start = time.perf_counter()
+
         for batch_idx, batch in enumerate(train_loader):
+            data_time = time.perf_counter() - data_start
+            step_start = time.perf_counter()
             emg = batch["emg"].to(device)
             targets = batch["joint_angles"].to(device)
-            calibration_recordings = batch["calibration_recordings"]  # List[List[Tensor]]
+            calibration_emg = batch["calibration_emg"].to(device)  # (B, max_k, 16, L)
+            calibration_k = batch["calibration_k"].to(device)  # (B,)
             
             optimizer.zero_grad()
             
             try:
-                predictions = model.forward_with_full_recordings(
+                fwd_start = time.perf_counter()
+                predictions = model.forward_with_raw_calibration(
                     emg=emg,
-                    calibration_recordings=calibration_recordings,
+                    calibration_emg=calibration_emg,
+                    num_calibration_samples=calibration_k,
                 )
                 
                 # Handle length mismatch
@@ -456,11 +547,27 @@ def train_react_emg(
                 targets_trimmed = targets[..., :min_len]
                 
                 loss = criterion(predictions, targets_trimmed)
+                torch.cuda.synchronize() 
+                fwd_time = time.perf_counter() - fwd_start
+                bwd_start = time.perf_counter()
                 loss.backward()
                 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                torch.cuda.synchronize()
+                bwd_time = time.perf_counter() - bwd_start
+                step_total_time = time.perf_counter() - step_start
                 epoch_losses.append(loss.item())
+
+                if batch_idx % 10 == 0:
+                    log(
+                        f"Epoch {epoch+1} [{batch_idx:4d}/{len(train_loader)}] | "
+                        f"Loss: {loss.item():.4f} | "
+                        f"Data: {data_time:.3f}s | Fwd: {fwd_time:.3f}s | Bwd: {bwd_time:.3f}s | "
+                        f"Total: {step_total_time:.3f}s"
+                    )
+                data_start = time.perf_counter()
                 
             except Exception as e:
                 print(f"Error in batch {batch_idx}: {e}")
@@ -477,12 +584,14 @@ def train_react_emg(
             for batch in val_loader:
                 emg = batch["emg"].to(device)
                 targets = batch["joint_angles"].to(device)
-                calibration_recordings = batch["calibration_recordings"]  # List[List[Tensor]]
+                calibration_emg = batch["calibration_emg"].to(device)
+                calibration_k = batch["calibration_k"].to(device)
                 
                 try:
-                    predictions = model.forward_with_full_recordings(
+                    predictions = model.forward_with_raw_calibration(
                         emg=emg,
-                        calibration_recordings=calibration_recordings,
+                        calibration_emg=calibration_emg,
+                        num_calibration_samples=calibration_k,
                     )
                     
                     pred_len = predictions.shape[-1]
@@ -635,3 +744,25 @@ def main(
     print(f"Best val loss: {result['best_val_loss']:.4f}")
     print(f"Best epoch: {result['best_epoch']}")
     print(f"Output dir: {result['output_dir']}")
+
+
+@app.local_entrypoint(name="precompute_cache")
+def precompute_cache_entrypoint(
+    window_length: int = 11790,
+    stride: int = 2000,
+):
+    """Pre-validate all sessions and cache results on the Modal volume.
+    
+    Run once before training to eliminate the ~5-min validation step:
+        modal run scripts/train_modal.py::precompute_cache
+    
+    Subsequent `modal run scripts/train_modal.py` calls will
+    automatically load the cached validation manifest and skip
+    the expensive per-file HDF5 checks.
+    """
+    precompute_dataset_cache.remote(
+        window_length=window_length,
+        stride=stride,
+    )
+    print("\nCache precomputed and committed to volume!")
+    print("Training runs will now skip session validation.")

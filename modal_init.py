@@ -50,6 +50,7 @@ image = (
 		"hydra-core==1.3.2",
 		"omegaconf==2.3.0",
 		"tqdm==4.66.4",
+		"joblib==1.4.2",
 	)
 	.add_local_dir(str(LOCAL_EMG2POSE_REPO), remote_path=REMOTE_REPO_PATH)
 )
@@ -85,6 +86,7 @@ def _ensure_symlink(target: Path, link_path: Path) -> None:
 	image=image,
 	volumes={VOLUME_MOUNT_PATH: dataset_volume},
 	timeout=60 * 60 * 24,
+	cpu=16,
 )
 def setup_and_run_test(
 	download_dataset: bool = True,
@@ -93,14 +95,14 @@ def setup_and_run_test(
 	checkpoint_name: str = "tracking_vemg2pose.ckpt",
 ) -> None:
 	persistent_root = Path(VOLUME_MOUNT_PATH)
-	dataset_dir = persistent_root / "emg2pose_dataset"
+	dataset_dir = persistent_root / "emg2pose_data"
 	metadata_file = dataset_dir / "metadata.csv"
 
 	checkpoints_archive = persistent_root / "emg2pose_model_checkpoints.tar.gz"
 	checkpoints_dir = persistent_root / "emg2pose_model_checkpoints"
 	checkpoint_path = checkpoints_dir / checkpoint_name
 
-	home_dataset_dir = Path("/root/emg2pose_dataset")
+	home_dataset_dir = Path("/root/emg2pose_data")
 	home_checkpoints_dir = Path("/root/emg2pose_model_checkpoints")
 
 	if download_dataset and not metadata_file.exists():
@@ -159,6 +161,7 @@ def setup_and_run_test(
 			f"data_location={home_dataset_dir}",
 			f"experiment={experiment}",
 			f"checkpoint={home_checkpoints_dir / checkpoint_name}",
+			"num_workers=12",
 		]
 		print(f"$ {' '.join(cmd)}")
 		subprocess.run(cmd, cwd=REMOTE_REPO_PATH, env=env, check=True)
