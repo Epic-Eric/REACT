@@ -155,15 +155,15 @@ def precompute_dataset_cache(
     stride: int = 2000,
     num_workers: int = 10,
 ):
-    """Pre-validate all sessions and save cache to persistent volume.
+    """Pre-validate all sessions per split and save caches to persistent volume.
     
     Run this ONCE before training to avoid the ~5-min validation step:
         modal run scripts/train_modal.py::precompute_cache
     
-    The cache is stored at /persistent/dataset_cache/ and will be
-    reused automatically by train_react_emg on subsequent runs.
+    Generates separate caches for train (stride), val (stride*2), and
+    test (stride*2).  Stored at /persistent/dataset_cache/ and reused
+    automatically by train_react_emg on subsequent runs.
     """
-    import shutil
     import pandas as pd
     import subprocess
 
@@ -188,6 +188,9 @@ def precompute_dataset_cache(
 
     metadata = pd.read_csv(metadata_file)
     print(f"Total files in metadata: {len(metadata)}")
+    for split_name in ["train", "val", "test"]:
+        split_df = metadata[metadata["split"] == split_name]
+        print(f"  {split_name}: {len(split_df)} sessions, {split_df['user'].nunique()} unique users")
 
     _precompute(
         data_dir=home_dataset,
@@ -395,39 +398,20 @@ def train_react_emg(
     cache_dir.mkdir(parents=True, exist_ok=True)
     log(f"Dataset cache dir: {cache_dir}")
     
-    # Load metadata and create splits
+    # Load metadata and create splits using official emg2pose split column
     import pandas as pd
     metadata = pd.read_csv(metadata_file)
     
-    # emg2pose metadata columns: session, user, filename, etc.
-    # 'filename' is the HDF5 basename (e.g., 2022-04-07-...-recording-1_left)
-    # 'session' is the session ID (shared by multiple recordings)
-    # 'user' is the user ID
-    all_filenames = metadata["filename"].unique().tolist()
-    log(f"Total files: {len(all_filenames)}")
-    
-    # Split by user for proper generalization
-    users = metadata["user"].unique().tolist()
-    np.random.seed(seed)
-    np.random.shuffle(users)
-    
-    n_train = int(0.7 * len(users))
-    n_val = int(0.15 * len(users))
-    
-    train_users = set(users[:n_train])
-    val_users = set(users[n_train:n_train + n_val])
-    test_users = set(users[n_train + n_val:])
-    
-    log(f"Users: {len(train_users)} train, {len(val_users)} val, {len(test_users)} test")
+    log(f"Total files: {len(metadata)}")
+    for split_name in ["train", "val", "test"]:
+        split_df = metadata[metadata["split"] == split_name]
+        log(f"  {split_name}: {len(split_df)} sessions, {split_df['user'].nunique()} unique users")
     
     # Create datasets from metadata with parallel validation
     log("Building datasets with parallel workers...")
     train_dataset, val_dataset, test_dataset = create_lazy_datasets_from_metadata(
         data_dir=home_dataset,
         metadata_df=metadata,
-        train_users=train_users,
-        val_users=val_users,
-        test_users=test_users,
         window_length=cfg["data"]["window_length"],
         stride=cfg["data"]["stride"],
         calibration_k=k_max,
@@ -445,8 +429,8 @@ def train_react_emg(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_calibrated_batch,
-        prefetch_factor=8,  # Prefetch batches for smoother training
-        persistent_workers=True,  # Keep workers alive across epochs
+        prefetch_factor=2,  # Keep low to avoid /dev/shm exhaustion
+        persistent_workers=True,
     )
     
     val_loader = torch.utils.data.DataLoader(
@@ -456,8 +440,8 @@ def train_react_emg(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_calibrated_batch,
-        prefetch_factor=8,  # Prefetch batches for smoother training
-        persistent_workers=True,  # Keep workers alive across epochs
+        prefetch_factor=2,  # Keep low to avoid /dev/shm exhaustion
+        persistent_workers=True,
     )
     
     log(f"Train batches: {len(train_loader)}")
