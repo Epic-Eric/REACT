@@ -558,7 +558,6 @@ def train_react_emg(
     if resume_checkpoint:
         import re
         log(f"\nLoading checkpoint: {resume_checkpoint}")
-        dataset_volume.reload()
         ckpt = torch.load(resume_checkpoint, map_location=device)
         state_dict = ckpt["model_state_dict"]
         # Strip _orig_mod. prefixes from torch.compile if present
