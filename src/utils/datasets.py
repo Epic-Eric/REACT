@@ -411,9 +411,14 @@ class PrebuiltCalibratedDataset(Dataset):
                 indices = torch.randint(pool_size, (max_k,))
             cal_windows = cal_pool[indices]
         else:
-            cal_windows = torch.zeros(
-                max_k, 16, self.calibration_window_length
-            )
+            # Use encoded feature shape if pools have been pre-encoded,
+            # otherwise fall back to raw EMG shape.
+            if hasattr(self, '_encoded_cal_shape') and self._encoded_cal_shape is not None:
+                cal_windows = torch.zeros(max_k, *self._encoded_cal_shape)
+            else:
+                cal_windows = torch.zeros(
+                    max_k, 16, self.calibration_window_length
+                )
 
         sample["calibration_emg"] = cal_windows
         return sample

@@ -140,6 +140,45 @@ def collate_calibrated_batch(batch):
 collate_with_variable_calibration = collate_calibrated_batch
 
 
+def pre_encode_calibration_pools(dataset, encoder, device, batch_size=128):
+    """Pre-encode all calibration pool windows with the frozen encoder.
+
+    Replaces raw EMG tensors (pool_size, 16, L) with encoded features
+    (pool_size, C, L') in-place, eliminating redundant encoder passes
+    during training.  The encoded features are kept on CPU and moved
+    to GPU per-batch by the DataLoader.
+
+    Also sets ``dataset._encoded_cal_shape = (C, L')`` so that the
+    ``__getitem__`` fallback path creates correctly-shaped zero tensors.
+    """
+    import torch
+    encoder.eval()
+    total_windows = sum(p.shape[0] for p in dataset.calibration_pools.values())
+    encoded_count = 0
+    encoded_pools = {}  # build new dict to avoid mutating during iteration
+    with torch.no_grad():
+        for user_id, pool in dataset.calibration_pools.items():
+            # pool: (pool_size, 16, L)
+            encoded_chunks = []
+            for i in range(0, pool.shape[0], batch_size):
+                chunk = pool[i:i + batch_size].to(device)
+                enc = encoder(chunk)  # (chunk_size, C, L')
+                encoded_chunks.append(enc.cpu())
+            encoded_pools[user_id] = torch.cat(encoded_chunks, dim=0)
+            encoded_count += pool.shape[0]
+    # Replace all pools atomically and store encoded shape for fallback
+    dataset.calibration_pools = encoded_pools
+    sample_pool = next(iter(encoded_pools.values()))
+    dataset._encoded_cal_shape = tuple(sample_pool.shape[1:])  # (C, L')
+    # Verify all pools have the same feature shape
+    for uid, pool in encoded_pools.items():
+        assert pool.shape[1:] == sample_pool.shape[1:], (
+            f"Shape mismatch for user {uid}: {pool.shape} vs expected {sample_pool.shape}"
+        )
+    print(f"  Pre-encoded {encoded_count}/{total_windows} calibration windows "
+          f"-> feature shape {dataset._encoded_cal_shape}")
+
+
 # =============================================================================
 # Training Function
 # =============================================================================
@@ -283,6 +322,14 @@ def train_react_emg(
     seed = int(cfg.get("seed", 42))
     commit_every = int(cfg["output"].get("commit_every", 10))
     
+    # Phase 2: encoder unfreezing config
+    num_epochs_enc_unfreeze = int(cfg["training"].get("num_epochs_enc_unfreeze", 0))
+    enc_unfreeze_cfg = cfg["training"].get("encoder_unfreeze", {})
+    enc_base_lr = float(enc_unfreeze_cfg.get("base_lr", 1e-4))
+    enc_lr_decay = float(enc_unfreeze_cfg.get("lr_decay", 0.5))
+    
+    total_epochs = num_epochs + num_epochs_enc_unfreeze
+    
     train_sessions_limit = cfg["data"].get("train_sessions_limit")
     val_sessions_limit = cfg["data"].get("val_sessions_limit")
     
@@ -379,10 +426,15 @@ def train_react_emg(
         log(f"GPU: {torch.cuda.get_device_name(0)}")
     log("")
     log("Training parameters (from config):")
-    log(f"  Epochs: {num_epochs}")
+    log(f"  Phase 1 epochs (frozen encoder): {num_epochs}")
+    log(f"  Phase 2 epochs (encoder unfreeze): {num_epochs_enc_unfreeze}")
+    log(f"  Total epochs: {total_epochs}")
     log(f"  Batch size: {batch_size}")
     log(f"  Learning rate: {lr}")
     log(f"  Weight decay: {weight_decay}")
+    if num_epochs_enc_unfreeze > 0:
+        log(f"  Encoder unfreeze base LR: {enc_base_lr}")
+        log(f"  Encoder layerwise LR decay: {enc_lr_decay}")
     log("")
     log("Calibration parameters:")
     log(f"  K min: {k_min}")
@@ -469,6 +521,29 @@ def train_react_emg(
     log(f"Total parameters: {num_params:,}")
     log(f"Trainable parameters: {trainable_params:,}")
     
+    # Save raw calibration pools before encoding (needed for Phase 2 re-encoding)
+    import copy
+    raw_train_cal_pools = {uid: pool.clone() for uid, pool in train_dataset.calibration_pools.items()}
+    raw_val_cal_pools = {uid: pool.clone() for uid, pool in val_dataset.calibration_pools.items()}
+    log(f"Saved raw calibration pools ({len(raw_train_cal_pools)} train, {len(raw_val_cal_pools)} val users)")
+    
+    # Pre-encode calibration pools (eliminates B*K redundant encoder passes per batch)
+    log("\nPre-encoding calibration pools (one-time cost)...")
+    pre_encode_calibration_pools(train_dataset, model.encoder, device, batch_size=128)
+    pre_encode_calibration_pools(val_dataset, model.encoder, device, batch_size=128)
+    log("Calibration pools pre-encoded. Training will use model.forward() with cached features.")
+    
+    # Compile trainable sub-modules with torch.compile for faster execution
+    if hasattr(torch, 'compile'):
+        log("Compiling trainable model components with torch.compile...")
+        try:
+            model.user_encoder = torch.compile(model.user_encoder)
+            model.film_layer = torch.compile(model.film_layer)
+            model.prediction_head = torch.compile(model.prediction_head)
+            log("torch.compile applied to user_encoder, film_layer, prediction_head")
+        except Exception as e:
+            log(f"torch.compile failed (non-fatal): {e}")
+    
     # Training setup (ensure proper types for optimizer params)
     betas = tuple(float(b) for b in cfg["training"]["optimizer"]["betas"])
     eps = float(cfg["training"]["optimizer"]["eps"])
@@ -488,12 +563,18 @@ def train_react_emg(
     )
     criterion = nn.MSELoss()
     
+    # Mixed precision training (AMP) – ~2x speedup on A100
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    log(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled'}")
+    
     # Training loop
-    log("\nStarting training...")
+    log("\nStarting Phase 1: Frozen Encoder Training...")
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
     best_epoch = 0
+    phase_labels = []  # Track which phase each epoch belongs to
     
     start_time = time.time()
     
@@ -508,38 +589,43 @@ def train_react_emg(
         for batch_idx, batch in enumerate(train_loader):
             data_time = time.perf_counter() - data_start
             step_start = time.perf_counter()
-            emg = batch["emg"].to(device)
-            targets = batch["joint_angles"].to(device)
-            calibration_emg = batch["calibration_emg"].to(device)  # (B, max_k, 16, L)
-            calibration_k = batch["calibration_k"].to(device)  # (B,)
+            emg = batch["emg"].to(device, non_blocking=True)
+            targets = batch["joint_angles"].to(device, non_blocking=True)
+            # calibration_emg is now PRE-ENCODED features (B, K, C, L')
+            calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
+            calibration_k = batch["calibration_k"].to(device, non_blocking=True)
             
             optimizer.zero_grad()
             
             try:
                 fwd_start = time.perf_counter()
-                predictions = model.forward_with_raw_calibration(
-                    emg=emg,
-                    calibration_emg=calibration_emg,
-                    num_calibration_samples=calibration_k,
-                )
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    # Use model.forward() with pre-encoded calibration features
+                    # (no redundant encoder passes for calibration)
+                    predictions = model(
+                        emg=emg,
+                        calibration_features=calibration_features,
+                        num_calibration_samples=calibration_k,
+                    )
+                    
+                    # Handle length mismatch
+                    pred_len = predictions.shape[-1]
+                    target_len = targets.shape[-1]
+                    min_len = min(pred_len, target_len)
+                    predictions = predictions[..., :min_len]
+                    targets_trimmed = targets[..., :min_len]
+                    
+                    loss = criterion(predictions, targets_trimmed)
                 
-                # Handle length mismatch
-                pred_len = predictions.shape[-1]
-                target_len = targets.shape[-1]
-                min_len = min(pred_len, target_len)
-                predictions = predictions[..., :min_len]
-                targets_trimmed = targets[..., :min_len]
-                
-                loss = criterion(predictions, targets_trimmed)
-                torch.cuda.synchronize() 
                 fwd_time = time.perf_counter() - fwd_start
                 bwd_start = time.perf_counter()
-                loss.backward()
+                scaler.scale(loss).backward()
                 
                 if grad_clip > 0:
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-                torch.cuda.synchronize()
+                scaler.step(optimizer)
+                scaler.update()
                 bwd_time = time.perf_counter() - bwd_start
                 step_total_time = time.perf_counter() - step_start
                 epoch_losses.append(loss.item())
@@ -566,25 +652,26 @@ def train_react_emg(
         
         with torch.no_grad():
             for batch in val_loader:
-                emg = batch["emg"].to(device)
-                targets = batch["joint_angles"].to(device)
-                calibration_emg = batch["calibration_emg"].to(device)
-                calibration_k = batch["calibration_k"].to(device)
+                emg = batch["emg"].to(device, non_blocking=True)
+                targets = batch["joint_angles"].to(device, non_blocking=True)
+                calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
+                calibration_k = batch["calibration_k"].to(device, non_blocking=True)
                 
                 try:
-                    predictions = model.forward_with_raw_calibration(
-                        emg=emg,
-                        calibration_emg=calibration_emg,
-                        num_calibration_samples=calibration_k,
-                    )
-                    
-                    pred_len = predictions.shape[-1]
-                    target_len = targets.shape[-1]
-                    min_len = min(pred_len, target_len)
-                    predictions = predictions[..., :min_len]
-                    targets_trimmed = targets[..., :min_len]
-                    
-                    loss = criterion(predictions, targets_trimmed)
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        predictions = model(
+                            emg=emg,
+                            calibration_features=calibration_features,
+                            num_calibration_samples=calibration_k,
+                        )
+                        
+                        pred_len = predictions.shape[-1]
+                        target_len = targets.shape[-1]
+                        min_len = min(pred_len, target_len)
+                        predictions = predictions[..., :min_len]
+                        targets_trimmed = targets[..., :min_len]
+                        
+                        loss = criterion(predictions, targets_trimmed)
                     val_epoch_losses.append(loss.item())
                 except:
                     continue
@@ -595,8 +682,10 @@ def train_react_emg(
         scheduler.step()
         epoch_time = time.time() - epoch_start
         
+        phase_labels.append("phase1")
+        
         log(
-            f"Epoch {epoch + 1:3d}/{num_epochs} | "
+            f"Epoch {epoch + 1:3d}/{total_epochs} [Phase 1] | "
             f"Train: {avg_train_loss:.4f} | "
             f"Val: {avg_val_loss:.4f} | "
             f"LR: {scheduler.get_last_lr()[0]:.2e} | "
@@ -609,6 +698,7 @@ def train_react_emg(
             best_epoch = epoch + 1
             torch.save({
                 "epoch": epoch,
+                "phase": "phase1",
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_loss": best_val_loss,
@@ -620,11 +710,245 @@ def train_react_emg(
         if (epoch + 1) % commit_every == 0:
             dataset_volume.commit()
     
+    log(f"\nPhase 1 complete. Best val loss: {best_val_loss:.4f} (epoch {best_epoch})")
+    
+    # =========================================================================
+    # Phase 2: Gradual Encoder Unfreezing with Layerwise LR Decay
+    # =========================================================================
+    if num_epochs_enc_unfreeze > 0:
+        log("\n" + "=" * 60)
+        log("Phase 2: Gradual Encoder Unfreezing")
+        log("=" * 60)
+        
+        # Save phase 1 checkpoint as fallback
+        torch.save({
+            "epoch": num_epochs,
+            "phase": "end_phase1",
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_loss": best_val_loss,
+            "config": cfg,
+        }, output_dir / "phase1_final.pt")
+        log("Saved phase 1 final checkpoint as fallback.")
+        
+        # Get encoder layer groups in output→input order for gradual unfreezing.
+        # TdsNetwork.layers is nn.Sequential with:
+        #   [0] Conv1dBlock (input)    [1] Conv1dBlock
+        #   [2] TdsStage 0             [3] TdsStage 1 (output)
+        encoder_children = list(model.encoder.layers.children())
+        num_enc_layers = len(encoder_children)
+        # Reverse: output→input order
+        layers_output_to_input = list(reversed(encoder_children))
+        
+        log(f"Encoder has {num_enc_layers} layer groups.")
+        log(f"Unfreezing schedule: output→input over {num_epochs_enc_unfreeze} epochs")
+        for i, layer in enumerate(layers_output_to_input):
+            layer_lr = enc_base_lr * (enc_lr_decay ** i)
+            log(f"  Group {i} (encoder.layers[{num_enc_layers - 1 - i}]): "
+                f"LR = {layer_lr:.2e}  "
+                f"({type(layer).__name__})")
+        
+        # Allow gradients through encoder in forward pass
+        model.config.freeze_encoder = False
+        
+        # Distribute layer groups across unfreeze epochs
+        groups_per_epoch = max(1, num_enc_layers // num_epochs_enc_unfreeze)
+        
+        for unfreeze_epoch in range(num_epochs_enc_unfreeze):
+            global_epoch = num_epochs + unfreeze_epoch
+            epoch_start = time.time()
+            
+            # Determine which layer groups to unfreeze this epoch
+            start_idx = unfreeze_epoch * groups_per_epoch
+            # Last epoch unfreezes all remaining layers
+            if unfreeze_epoch == num_epochs_enc_unfreeze - 1:
+                end_idx = num_enc_layers
+            else:
+                end_idx = min(start_idx + groups_per_epoch, num_enc_layers)
+            
+            # Unfreeze the scheduled layers
+            for idx in range(start_idx, end_idx):
+                layer = layers_output_to_input[idx]
+                for param in layer.parameters():
+                    param.requires_grad = True
+                orig_idx = num_enc_layers - 1 - idx
+                n_params = sum(p.numel() for p in layer.parameters())
+                log(f"  Unfroze encoder.layers[{orig_idx}] "
+                    f"({type(layer).__name__}, {n_params:,} params)")
+            
+            # Build optimizer with layerwise LR decay param groups
+            param_groups = []
+            
+            # Non-encoder params (FiLM layers, user_encoder, prediction_head)
+            non_encoder_params = [
+                p for name, p in model.named_parameters()
+                if not name.startswith("encoder.") and p.requires_grad
+            ]
+            if non_encoder_params:
+                param_groups.append({"params": non_encoder_params, "lr": lr})
+            
+            # Encoder layers with layerwise LR decay (output→input)
+            for group_idx, layer in enumerate(layers_output_to_input):
+                layer_params = [p for p in layer.parameters() if p.requires_grad]
+                if layer_params:
+                    layer_lr = enc_base_lr * (enc_lr_decay ** group_idx)
+                    param_groups.append({
+                        "params": layer_params,
+                        "lr": layer_lr,
+                    })
+            
+            optimizer = torch.optim.AdamW(
+                param_groups,
+                weight_decay=weight_decay,
+                betas=betas,
+                eps=eps,
+            )
+            
+            trainable_params = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+            log(f"  Trainable parameters: {trainable_params:,}")
+            
+            # Restore raw calibration pools and re-encode with updated encoder
+            log(f"  Re-encoding calibration pools with updated encoder...")
+            train_dataset.calibration_pools = {uid: pool.clone() for uid, pool in raw_train_cal_pools.items()}
+            val_dataset.calibration_pools = {uid: pool.clone() for uid, pool in raw_val_cal_pools.items()}
+            pre_encode_calibration_pools(train_dataset, model.encoder, device, batch_size=128)
+            pre_encode_calibration_pools(val_dataset, model.encoder, device, batch_size=128)
+            
+            # Train one epoch
+            model.train()
+            epoch_losses = []
+            data_start = time.perf_counter()
+            
+            for batch_idx, batch in enumerate(train_loader):
+                data_time = time.perf_counter() - data_start
+                step_start = time.perf_counter()
+                emg = batch["emg"].to(device, non_blocking=True)
+                targets = batch["joint_angles"].to(device, non_blocking=True)
+                calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
+                calibration_k = batch["calibration_k"].to(device, non_blocking=True)
+                
+                optimizer.zero_grad()
+                
+                try:
+                    fwd_start = time.perf_counter()
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        predictions = model(
+                            emg=emg,
+                            calibration_features=calibration_features,
+                            num_calibration_samples=calibration_k,
+                        )
+                        
+                        pred_len = predictions.shape[-1]
+                        target_len = targets.shape[-1]
+                        min_len = min(pred_len, target_len)
+                        predictions = predictions[..., :min_len]
+                        targets_trimmed = targets[..., :min_len]
+                        
+                        loss = criterion(predictions, targets_trimmed)
+                    
+                    fwd_time = time.perf_counter() - fwd_start
+                    bwd_start = time.perf_counter()
+                    scaler.scale(loss).backward()
+                    
+                    if grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    bwd_time = time.perf_counter() - bwd_start
+                    step_total_time = time.perf_counter() - step_start
+                    epoch_losses.append(loss.item())
+                    
+                    if batch_idx % 10 == 0:
+                        # Show LRs for first encoder group and FiLM layers
+                        enc_lrs = [g['lr'] for g in optimizer.param_groups[1:]]
+                        enc_lr_str = "/".join(f"{r:.1e}" for r in enc_lrs[:3])
+                        log(
+                            f"Epoch {global_epoch+1} [{batch_idx:4d}/{len(train_loader)}] | "
+                            f"Loss: {loss.item():.4f} | "
+                            f"Data: {data_time:.3f}s | Fwd: {fwd_time:.3f}s | Bwd: {bwd_time:.3f}s | "
+                            f"Total: {step_total_time:.3f}s | "
+                            f"Enc LRs: {enc_lr_str}"
+                        )
+                    data_start = time.perf_counter()
+                    
+                except Exception as e:
+                    print(f"Error in batch {batch_idx}: {e}")
+                    import traceback; traceback.print_exc()
+                    continue
+            
+            avg_train_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
+            train_losses.append(avg_train_loss)
+            
+            # Validate
+            model.eval()
+            val_epoch_losses = []
+            
+            with torch.no_grad():
+                for batch in val_loader:
+                    emg = batch["emg"].to(device, non_blocking=True)
+                    targets = batch["joint_angles"].to(device, non_blocking=True)
+                    calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
+                    calibration_k = batch["calibration_k"].to(device, non_blocking=True)
+                    
+                    try:
+                        with torch.cuda.amp.autocast(enabled=use_amp):
+                            predictions = model(
+                                emg=emg,
+                                calibration_features=calibration_features,
+                                num_calibration_samples=calibration_k,
+                            )
+                            
+                            pred_len = predictions.shape[-1]
+                            target_len = targets.shape[-1]
+                            min_len = min(pred_len, target_len)
+                            predictions = predictions[..., :min_len]
+                            targets_trimmed = targets[..., :min_len]
+                            
+                            loss = criterion(predictions, targets_trimmed)
+                        val_epoch_losses.append(loss.item())
+                    except:
+                        continue
+            
+            avg_val_loss = sum(val_epoch_losses) / max(len(val_epoch_losses), 1)
+            val_losses.append(avg_val_loss)
+            phase_labels.append("phase2")
+            
+            epoch_time = time.time() - epoch_start
+            
+            log(
+                f"Epoch {global_epoch + 1:3d}/{total_epochs} [Phase 2] | "
+                f"Train: {avg_train_loss:.4f} | "
+                f"Val: {avg_val_loss:.4f} | "
+                f"Time: {epoch_time:.1f}s"
+            )
+            
+            # Save best model
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_epoch = global_epoch + 1
+                torch.save({
+                    "epoch": global_epoch,
+                    "phase": "phase2",
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": best_val_loss,
+                    "config": cfg,
+                }, output_dir / "best_model.pt")
+                log(f"  -> New best! Saved to {output_dir / 'best_model.pt'}")
+            
+            # Commit volume every epoch during phase 2
+            dataset_volume.commit()
+        
+        log(f"\nPhase 2 complete. Best val loss: {best_val_loss:.4f} (epoch {best_epoch})")
+    
     total_time = time.time() - start_time
     
     # Save final model
     torch.save({
-        "epoch": num_epochs,
+        "epoch": total_epochs,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "train_losses": train_losses,
@@ -633,10 +957,14 @@ def train_react_emg(
         "config": cfg,
     }, output_dir / "final_model.pt")
     
-    # Save training curves
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, 'b-', label='Train Loss')
-    plt.plot(val_losses, 'r-', label='Val Loss')
+    # Save training curves with phase boundary
+    plt.figure(figsize=(12, 6))
+    epochs_axis = list(range(1, len(train_losses) + 1))
+    plt.plot(epochs_axis, train_losses, 'b-', label='Train Loss')
+    plt.plot(epochs_axis, val_losses, 'r-', label='Val Loss')
+    if num_epochs_enc_unfreeze > 0 and num_epochs > 0:
+        plt.axvline(x=num_epochs + 0.5, color='green', linestyle='--',
+                    alpha=0.7, label='Phase 1→2 (unfreeze encoder)')
     plt.xlabel('Epoch')
     plt.ylabel('Loss (MSE)')
     plt.title('REACT-EMG Training (Full Dataset)')
@@ -652,6 +980,9 @@ def train_react_emg(
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
         "total_time_minutes": total_time / 60,
+        "num_epochs_phase1": num_epochs,
+        "num_epochs_phase2": num_epochs_enc_unfreeze,
+        "phase_labels": phase_labels,
         "config": cfg,
     }
     with open(output_dir / "history.json", "w") as f:
@@ -663,6 +994,8 @@ def train_react_emg(
     log("Training Complete!")
     log("=" * 60)
     log(f"Total time: {total_time / 60:.1f} minutes")
+    log(f"Phase 1 epochs: {num_epochs} (frozen encoder)")
+    log(f"Phase 2 epochs: {num_epochs_enc_unfreeze} (encoder unfreezing)")
     log(f"Best val loss: {best_val_loss:.4f} (epoch {best_epoch})")
     log(f"Outputs saved to: {output_dir}")
     

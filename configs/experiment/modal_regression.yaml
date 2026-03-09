@@ -8,7 +8,8 @@
 
 # Training parameters (aligned with emg2pose base.yaml)
 training:
-  num_epochs: 10  # emg2pose default
+  num_epochs: 10  # Phase 1: frozen encoder, train FiLM layers
+  num_epochs_enc_unfreeze: 0  # Phase 2: set >0 to gradually unfreeze encoder
   batch_size: 64   # emg2pose default
   gradient_clip_norm: 0.0  # No clipping for regression (emg2pose: gradient_clip_val: 0)
   num_workers: 16
@@ -21,10 +22,15 @@ training:
     betas: [0.9, 0.999]
     eps: 1e-8
   
-  # Scheduler
+  # Scheduler (Phase 1 only; Phase 2 uses layerwise LR decay)
   scheduler:
     name: cosine
     min_lr: 1e-7
+  
+  # Encoder unfreezing (Phase 2) — inactive when num_epochs_enc_unfreeze=0
+  encoder_unfreeze:
+    base_lr: 1e-4
+    lr_decay: 0.5
   
   # Early stopping (emg2pose: patience=50)
   early_stopping:
