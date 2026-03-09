@@ -43,7 +43,7 @@ class PredictionHeadConfig:
     out_channels: int = 20
     dropout: float = 0.1
     use_layer_norm: bool = True
-    output_scale: float = 1.0
+    output_scale: float = 0.01
 
 
 @dataclass
@@ -219,6 +219,11 @@ class FiLMConditionedModel(nn.Module):
         # Track context requirements from encoder
         self.left_context = 0
         self.right_context = 0
+        if pretrained_encoder is not None:
+            if hasattr(pretrained_encoder, 'left_context'):
+                self.left_context = pretrained_encoder.left_context
+            if hasattr(pretrained_encoder, 'right_context'):
+                self.right_context = pretrained_encoder.right_context
     
     def _freeze_encoder(self):
         """Freeze pretrained encoder parameters."""

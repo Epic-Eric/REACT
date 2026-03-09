@@ -120,10 +120,16 @@ def collate_calibrated_batch(batch):
     no_ik_failure = torch.stack([item["no_ik_failure"] for item in batch])
     calibration_emg = torch.stack([item["calibration_emg"] for item in batch])  # (B, max_k, 16, L)
 
-    # One k for the whole iteration — eliminates padding entirely.
+    # Sample k for the whole batch.  Support k=0 (zero-embedding path)
+    # with 10% probability to ensure the zero_embedding gets trained.
     max_k = calibration_emg.shape[1]
-    k = int(np.random.randint(1, max_k + 1)) if max_k > 1 else max_k
-    calibration_emg = calibration_emg[:, :k, :, :]  # (B, k, 16, L)
+    if max_k > 1 and np.random.random() < 0.1:
+        k = 0
+    elif max_k > 1:
+        k = int(np.random.randint(1, max_k + 1))
+    else:
+        k = max_k
+    calibration_emg = calibration_emg[:, :max(k, 1), :, :]  # keep at least 1 for shape
 
     return {
         "emg": emg,  # (B, 16, L)
@@ -248,6 +254,32 @@ def precompute_dataset_cache(
 @app.function(
     image=image,
     volumes={VOLUME_MOUNT_PATH: dataset_volume},
+    timeout=300,
+)
+def download_run_outputs(output_dir: str) -> dict:
+    """Read all output files from a training run directory on the volume.
+
+    Returns a dict mapping filename -> bytes for every file in output_dir.
+    Called from the local entrypoint after training completes.
+    """
+    import os
+
+    dataset_volume.reload()
+    results = {}
+    if not os.path.isdir(output_dir):
+        print(f"Warning: output dir {output_dir} not found on volume")
+        return results
+    for fname in os.listdir(output_dir):
+        fpath = os.path.join(output_dir, fname)
+        if os.path.isfile(fpath):
+            with open(fpath, "rb") as f:
+                results[fname] = f.read()
+    return results
+
+
+@app.function(
+    image=image,
+    volumes={VOLUME_MOUNT_PATH: dataset_volume},
     gpu="A100-80GB", 
     timeout=60 * 60 * 12,  # 12 hours max
     cpu=10,
@@ -257,6 +289,7 @@ def train_react_emg(
     config_file: str = "modal_regression.yaml",
     config_overrides: dict | None = None,
     download_if_missing: bool = True,
+    resume_checkpoint: str | None = None,
 ):
     """Train REACT-EMG model on full dataset.
     
@@ -265,6 +298,10 @@ def train_react_emg(
                      Options: modal_regression.yaml, modal_tracking.yaml
         config_overrides: Dictionary of config values to override.
         download_if_missing: Download dataset if not present.
+        resume_checkpoint: Path to a Phase 1 checkpoint on the Modal volume
+            (e.g. /persistent/react_outputs/run_.../best_model.pt).
+            If provided, loads trained FiLM/head weights and skips Phase 1,
+            jumping directly to Phase 2 encoder unfreezing.
     """
     import json
     import time
@@ -516,6 +553,27 @@ def train_react_emg(
     )
     model = FiLMConditionedModel(model_config, pretrained_encoder=pretrained_encoder).to(device)
     
+    # Load checkpoint weights if resuming (skip Phase 1)
+    skip_phase1 = False
+    if resume_checkpoint:
+        import re
+        log(f"\nLoading checkpoint: {resume_checkpoint}")
+        dataset_volume.reload()
+        ckpt = torch.load(resume_checkpoint, map_location=device)
+        state_dict = ckpt["model_state_dict"]
+        # Strip _orig_mod. prefixes from torch.compile if present
+        state_dict = {re.sub(r'_orig_mod\.', '', k): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        log(f"  Loaded weights from epoch {ckpt.get('epoch', '?')}, "
+            f"phase {ckpt.get('phase', '?')}, "
+            f"val_loss {ckpt.get('val_loss', '?')}")
+        if num_epochs_enc_unfreeze > 0:
+            skip_phase1 = True
+            log("  Skipping Phase 1 — jumping directly to Phase 2 encoder unfreezing")
+        else:
+            log("  WARNING: resume_checkpoint provided but num_epochs_enc_unfreeze=0; "
+                "no Phase 2 to run. Phase 1 will proceed from loaded weights.")
+    
     num_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f"Total parameters: {num_params:,}")
@@ -533,8 +591,11 @@ def train_react_emg(
     pre_encode_calibration_pools(val_dataset, model.encoder, device, batch_size=128)
     log("Calibration pools pre-encoded. Training will use model.forward() with cached features.")
     
-    # Compile trainable sub-modules with torch.compile for faster execution
-    if hasattr(torch, 'compile'):
+    # Compile trainable sub-modules with torch.compile for faster execution.
+    # Skip if Phase 2 unfreezing is planned — compiled graphs may cache
+    # no-grad assumptions from Phase 1 that break when the encoder is
+    # unfrozen and gradients flow through it.
+    if hasattr(torch, 'compile') and num_epochs_enc_unfreeze == 0:
         log("Compiling trainable model components with torch.compile...")
         try:
             model.user_encoder = torch.compile(model.user_encoder)
@@ -543,6 +604,8 @@ def train_react_emg(
             log("torch.compile applied to user_encoder, film_layer, prediction_head")
         except Exception as e:
             log(f"torch.compile failed (non-fatal): {e}")
+    elif num_epochs_enc_unfreeze > 0:
+        log("Skipping torch.compile (Phase 2 encoder unfreezing is planned)")
     
     # Training setup (ensure proper types for optimizer params)
     betas = tuple(float(b) for b in cfg["training"]["optimizer"]["betas"])
@@ -561,7 +624,12 @@ def train_react_emg(
         T_max=num_epochs,
         eta_min=min_lr,
     )
-    criterion = nn.MSELoss()
+    criterion = nn.L1Loss()  # MAE loss (matches emg2pose baseline)
+    
+    # Get encoder context for proper target alignment
+    left_context = getattr(model.encoder, 'left_context', 0)
+    right_context = getattr(model.encoder, 'right_context', 0)
+    log(f"Encoder context: left={left_context}, right={right_context}")
     
     # Mixed precision training (AMP) – ~2x speedup on A100
     use_amp = device.type == "cuda"
@@ -569,7 +637,6 @@ def train_react_emg(
     log(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled'}")
     
     # Training loop
-    log("\nStarting Phase 1: Frozen Encoder Training...")
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
@@ -578,7 +645,18 @@ def train_react_emg(
     
     start_time = time.time()
     
-    for epoch in range(num_epochs):
+    if skip_phase1:
+        log("\nPhase 1 skipped (loaded from checkpoint).")
+        # Still set best_val_loss from checkpoint so Phase 2 has a baseline
+        if resume_checkpoint:
+            ckpt_val = ckpt.get("val_loss")
+            if ckpt_val is not None:
+                best_val_loss = float(ckpt_val)
+                log(f"  Using checkpoint val_loss as baseline: {best_val_loss:.4f}")
+    else:
+        log("\nStarting Phase 1: Frozen Encoder Training...")
+    
+    for epoch in range(0 if skip_phase1 else num_epochs):
         epoch_start = time.time()
         
         # Train
@@ -591,6 +669,7 @@ def train_react_emg(
             step_start = time.perf_counter()
             emg = batch["emg"].to(device, non_blocking=True)
             targets = batch["joint_angles"].to(device, non_blocking=True)
+            no_ik_failure = batch["no_ik_failure"].to(device, non_blocking=True)
             # calibration_emg is now PRE-ENCODED features (B, K, C, L')
             calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
             calibration_k = batch["calibration_k"].to(device, non_blocking=True)
@@ -600,22 +679,31 @@ def train_react_emg(
             try:
                 fwd_start = time.perf_counter()
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    # Use model.forward() with pre-encoded calibration features
-                    # (no redundant encoder passes for calibration)
                     predictions = model(
                         emg=emg,
                         calibration_features=calibration_features,
                         num_calibration_samples=calibration_k,
                     )
                     
-                    # Handle length mismatch
-                    pred_len = predictions.shape[-1]
-                    target_len = targets.shape[-1]
-                    min_len = min(pred_len, target_len)
-                    predictions = predictions[..., :min_len]
-                    targets_trimmed = targets[..., :min_len]
+                    # Trim targets for encoder left/right context
+                    start = left_context
+                    end = -right_context if right_context > 0 else None
+                    targets_trimmed = targets[..., start:end]
+                    mask_trimmed = no_ik_failure[..., start:end]
                     
-                    loss = criterion(predictions, targets_trimmed)
+                    # Interpolate predictions to match target temporal resolution
+                    target_len = targets_trimmed.shape[-1]
+                    predictions = nn.functional.interpolate(
+                        predictions, size=target_len, mode='linear',
+                        align_corners=False,
+                    )
+                    
+                    # Apply IK failure mask (only train on valid frames)
+                    mask = mask_trimmed.unsqueeze(1).expand_as(predictions)
+                    if mask.any():
+                        loss = criterion(predictions[mask], targets_trimmed[mask])
+                    else:
+                        continue  # skip batch with no valid frames
                 
                 fwd_time = time.perf_counter() - fwd_start
                 bwd_start = time.perf_counter()
@@ -654,6 +742,7 @@ def train_react_emg(
             for batch in val_loader:
                 emg = batch["emg"].to(device, non_blocking=True)
                 targets = batch["joint_angles"].to(device, non_blocking=True)
+                no_ik_failure = batch["no_ik_failure"].to(device, non_blocking=True)
                 calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
                 calibration_k = batch["calibration_k"].to(device, non_blocking=True)
                 
@@ -665,15 +754,24 @@ def train_react_emg(
                             num_calibration_samples=calibration_k,
                         )
                         
-                        pred_len = predictions.shape[-1]
-                        target_len = targets.shape[-1]
-                        min_len = min(pred_len, target_len)
-                        predictions = predictions[..., :min_len]
-                        targets_trimmed = targets[..., :min_len]
+                        start = left_context
+                        end = -right_context if right_context > 0 else None
+                        targets_trimmed = targets[..., start:end]
+                        mask_trimmed = no_ik_failure[..., start:end]
                         
-                        loss = criterion(predictions, targets_trimmed)
+                        target_len = targets_trimmed.shape[-1]
+                        predictions = nn.functional.interpolate(
+                            predictions, size=target_len, mode='linear',
+                            align_corners=False,
+                        )
+                        
+                        mask = mask_trimmed.unsqueeze(1).expand_as(predictions)
+                        if mask.any():
+                            loss = criterion(predictions[mask], targets_trimmed[mask])
+                        else:
+                            continue
                     val_epoch_losses.append(loss.item())
-                except:
+                except Exception:
                     continue
         
         avg_val_loss = sum(val_epoch_losses) / max(len(val_epoch_losses), 1)
@@ -754,6 +852,43 @@ def train_react_emg(
         # Distribute layer groups across unfreeze epochs
         groups_per_epoch = max(1, num_enc_layers // num_epochs_enc_unfreeze)
         
+        # Build Phase 2 optimizer ONCE to preserve Adam momentum/variance
+        # across epochs.  Start with non-encoder params; encoder param
+        # groups are added as layers are unfrozen.
+        non_encoder_params = [
+            p for name, p in model.named_parameters()
+            if not name.startswith("encoder.") and p.requires_grad
+        ]
+        p2_param_groups = [{"params": non_encoder_params, "lr": lr}]
+        
+        # Pre-add all encoder layer groups (initially empty; filled as
+        # layers are unfrozen).  This lets us use stable group indices.
+        enc_group_start_idx = len(p2_param_groups)  # 1
+        for group_idx, layer in enumerate(layers_output_to_input):
+            layer_lr = enc_base_lr * (enc_lr_decay ** group_idx)
+            p2_param_groups.append({
+                "params": [],  # populated when unfrozen
+                "lr": layer_lr,
+            })
+        
+        p2_optimizer = torch.optim.AdamW(
+            p2_param_groups,
+            weight_decay=weight_decay,
+            betas=betas,
+            eps=eps,
+        )
+        # Transfer Phase 1 optimizer state for non-encoder params
+        # by initializing from the Phase 1 optimizer's state for
+        # matching parameters.  optimizer.state is keyed by tensor
+        # objects, so build an id→state lookup first.
+        p1_state_by_id = {id(k): v for k, v in optimizer.state.items()}
+        transferred = 0
+        for p in non_encoder_params:
+            if id(p) in p1_state_by_id:
+                p2_optimizer.state[p] = p1_state_by_id[id(p)]
+                transferred += 1
+        log(f"Phase 2 optimizer created (transferred {transferred}/{len(non_encoder_params)} param states from Phase 1)")
+        
         for unfreeze_epoch in range(num_epochs_enc_unfreeze):
             global_epoch = num_epochs + unfreeze_epoch
             epoch_start = time.time()
@@ -766,43 +901,23 @@ def train_react_emg(
             else:
                 end_idx = min(start_idx + groups_per_epoch, num_enc_layers)
             
-            # Unfreeze the scheduled layers
+            # Unfreeze the scheduled layers and add params to optimizer
             for idx in range(start_idx, end_idx):
                 layer = layers_output_to_input[idx]
                 for param in layer.parameters():
                     param.requires_grad = True
+                # Add newly unfrozen params to the appropriate optimizer group
+                opt_group_idx = enc_group_start_idx + idx
+                p2_optimizer.param_groups[opt_group_idx]["params"] = [
+                    p for p in layer.parameters()
+                ]
                 orig_idx = num_enc_layers - 1 - idx
                 n_params = sum(p.numel() for p in layer.parameters())
                 log(f"  Unfroze encoder.layers[{orig_idx}] "
                     f"({type(layer).__name__}, {n_params:,} params)")
             
-            # Build optimizer with layerwise LR decay param groups
-            param_groups = []
-            
-            # Non-encoder params (FiLM layers, user_encoder, prediction_head)
-            non_encoder_params = [
-                p for name, p in model.named_parameters()
-                if not name.startswith("encoder.") and p.requires_grad
-            ]
-            if non_encoder_params:
-                param_groups.append({"params": non_encoder_params, "lr": lr})
-            
-            # Encoder layers with layerwise LR decay (output→input)
-            for group_idx, layer in enumerate(layers_output_to_input):
-                layer_params = [p for p in layer.parameters() if p.requires_grad]
-                if layer_params:
-                    layer_lr = enc_base_lr * (enc_lr_decay ** group_idx)
-                    param_groups.append({
-                        "params": layer_params,
-                        "lr": layer_lr,
-                    })
-            
-            optimizer = torch.optim.AdamW(
-                param_groups,
-                weight_decay=weight_decay,
-                betas=betas,
-                eps=eps,
-            )
+            # Use the persistent Phase 2 optimizer (not rebuilt each epoch)
+            optimizer = p2_optimizer
             
             trainable_params = sum(
                 p.numel() for p in model.parameters() if p.requires_grad
@@ -826,6 +941,7 @@ def train_react_emg(
                 step_start = time.perf_counter()
                 emg = batch["emg"].to(device, non_blocking=True)
                 targets = batch["joint_angles"].to(device, non_blocking=True)
+                no_ik_failure = batch["no_ik_failure"].to(device, non_blocking=True)
                 calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
                 calibration_k = batch["calibration_k"].to(device, non_blocking=True)
                 
@@ -840,13 +956,22 @@ def train_react_emg(
                             num_calibration_samples=calibration_k,
                         )
                         
-                        pred_len = predictions.shape[-1]
-                        target_len = targets.shape[-1]
-                        min_len = min(pred_len, target_len)
-                        predictions = predictions[..., :min_len]
-                        targets_trimmed = targets[..., :min_len]
+                        start = left_context
+                        end = -right_context if right_context > 0 else None
+                        targets_trimmed = targets[..., start:end]
+                        mask_trimmed = no_ik_failure[..., start:end]
                         
-                        loss = criterion(predictions, targets_trimmed)
+                        target_len = targets_trimmed.shape[-1]
+                        predictions = nn.functional.interpolate(
+                            predictions, size=target_len, mode='linear',
+                            align_corners=False,
+                        )
+                        
+                        mask = mask_trimmed.unsqueeze(1).expand_as(predictions)
+                        if mask.any():
+                            loss = criterion(predictions[mask], targets_trimmed[mask])
+                        else:
+                            continue
                     
                     fwd_time = time.perf_counter() - fwd_start
                     bwd_start = time.perf_counter()
@@ -890,6 +1015,7 @@ def train_react_emg(
                 for batch in val_loader:
                     emg = batch["emg"].to(device, non_blocking=True)
                     targets = batch["joint_angles"].to(device, non_blocking=True)
+                    no_ik_failure = batch["no_ik_failure"].to(device, non_blocking=True)
                     calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
                     calibration_k = batch["calibration_k"].to(device, non_blocking=True)
                     
@@ -901,15 +1027,24 @@ def train_react_emg(
                                 num_calibration_samples=calibration_k,
                             )
                             
-                            pred_len = predictions.shape[-1]
-                            target_len = targets.shape[-1]
-                            min_len = min(pred_len, target_len)
-                            predictions = predictions[..., :min_len]
-                            targets_trimmed = targets[..., :min_len]
+                            start = left_context
+                            end = -right_context if right_context > 0 else None
+                            targets_trimmed = targets[..., start:end]
+                            mask_trimmed = no_ik_failure[..., start:end]
                             
-                            loss = criterion(predictions, targets_trimmed)
+                            target_len = targets_trimmed.shape[-1]
+                            predictions = nn.functional.interpolate(
+                                predictions, size=target_len, mode='linear',
+                                align_corners=False,
+                            )
+                            
+                            mask = mask_trimmed.unsqueeze(1).expand_as(predictions)
+                            if mask.any():
+                                loss = criterion(predictions[mask], targets_trimmed[mask])
+                            else:
+                                continue
                         val_epoch_losses.append(loss.item())
-                    except:
+                    except Exception:
                         continue
             
             avg_val_loss = sum(val_epoch_losses) / max(len(val_epoch_losses), 1)
@@ -966,7 +1101,7 @@ def train_react_emg(
         plt.axvline(x=num_epochs + 0.5, color='green', linestyle='--',
                     alpha=0.7, label='Phase 1→2 (unfreeze encoder)')
     plt.xlabel('Epoch')
-    plt.ylabel('Loss (MSE)')
+    plt.ylabel('Loss (MAE)')
     plt.title('REACT-EMG Training (Full Dataset)')
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -1017,6 +1152,7 @@ def main(
     batch_size: int = None,
     lr: float = None,
     k_max: int = None,
+    resume_from: str = None,
 ):
     """Launch REACT-EMG training on Modal.
     
@@ -1027,6 +1163,9 @@ def main(
         batch_size: Override batch size.
         lr: Override learning rate.
         k_max: Override max calibration samples.
+        resume_from: Path to a Phase 1 checkpoint on the Modal volume.
+            Loads trained FiLM/head weights and skips Phase 1, jumping
+            directly to Phase 2 encoder unfreezing.
     
     Examples:
         # Train with regression mode (default)
@@ -1034,6 +1173,10 @@ def main(
         
         # Train with tracking mode
         modal run scripts/train_modal.py --config tracking
+        
+        # Skip Phase 1 and finetune encoder from a checkpoint
+        modal run scripts/train_modal.py --config tracking \\
+            --resume-from /persistent/react_outputs/run_.../best_model.pt
         
         # Override epochs
         modal run scripts/train_modal.py --config regression --epochs 100
@@ -1056,11 +1199,28 @@ def main(
     result = train_react_emg.remote(
         config_file=config_file,
         config_overrides=overrides if overrides else None,
+        resume_checkpoint=resume_from,
     )
     print(f"\nTraining completed!")
     print(f"Best val loss: {result['best_val_loss']:.4f}")
     print(f"Best epoch: {result['best_epoch']}")
     print(f"Output dir: {result['output_dir']}")
+
+    # Download outputs from Modal volume to local filesystem
+    remote_output_dir = result["output_dir"]
+    run_name = Path(remote_output_dir).name  # e.g. run_20260308_162810
+    local_output_dir = Path("outputs") / run_name
+    local_output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nDownloading logs to {local_output_dir}...")
+    files = download_run_outputs.remote(remote_output_dir)
+    for fname, content in files.items():
+        local_path = local_output_dir / fname
+        with open(local_path, "wb") as f:
+            f.write(content)
+        size_kb = len(content) / 1024
+        print(f"  {fname} ({size_kb:.1f} KB)")
+    print(f"All outputs saved to {local_output_dir}")
 
 
 @app.local_entrypoint(name="precompute_cache")
