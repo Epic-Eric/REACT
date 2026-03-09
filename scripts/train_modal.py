@@ -209,7 +209,7 @@ def precompute_dataset_cache(
 @app.function(
     image=image,
     volumes={VOLUME_MOUNT_PATH: dataset_volume},
-    gpu="A10G", 
+    gpu="A100-80GB", 
     timeout=60 * 60 * 12,  # 12 hours max
     cpu=10,
     memory=262144,  # 256GB RAM
@@ -429,8 +429,8 @@ def train_react_emg(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_calibrated_batch,
-        prefetch_factor=2,  # Keep low to avoid /dev/shm exhaustion
-        persistent_workers=True,
+        prefetch_factor=2,
+        persistent_workers=False,  # Allow crashed workers to be replaced
     )
     
     val_loader = torch.utils.data.DataLoader(
@@ -440,8 +440,8 @@ def train_react_emg(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_calibrated_batch,
-        prefetch_factor=2,  # Keep low to avoid /dev/shm exhaustion
-        persistent_workers=True,
+        prefetch_factor=2,
+        persistent_workers=False,
     )
     
     log(f"Train batches: {len(train_loader)}")

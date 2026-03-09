@@ -1,0 +1,96 @@
+# Modal cloud training - TRACKING mode
+# Aligned with emg2pose/config/experiment/tracking_vemg2pose.yaml
+#
+# Uses pretrained vemg2pose encoder (tracking mode)
+# - Provides initial position
+# - Predicts velocity (integrated for position)
+# - Uses gradient clipping
+# - LSTM decoder for temporal modeling
+
+# Training parameters (aligned with emg2pose base.yaml)
+training:
+  num_epochs: 10  # large dataset, only 10 is enough
+  batch_size: 64   # emg2pose default
+  gradient_clip_norm: 1.0  # Tracking uses clipping (emg2pose: gradient_clip_val: 1)
+  num_workers: 16
+  
+  # Optimizer (emg2pose uses Adam with lr=0.001)
+  optimizer:
+    name: adamw
+    lr: 1e-3  # emg2pose tracking lr
+    weight_decay: 1e-4
+    betas: [0.9, 0.999]
+    eps: 1e-8
+  
+  # Scheduler
+  scheduler:
+    name: cosine
+    min_lr: 1e-7
+  
+  # Early stopping (emg2pose: patience=50)
+  early_stopping:
+    patience: 50
+    monitor: val_loss
+    mode: min
+  
+  # Checkpointing
+  checkpoint:
+    save_every: 1
+    save_best: true
+
+# Device settings
+device: cuda
+
+# Model configuration
+model:
+  feature_dim: 64  # TDS output channels
+  user_embedding_dim: 128
+  freeze_encoder: true
+  # Use TRACKING checkpoint (tracking_vemg2pose)
+  pretrained_checkpoint: emg2pose_model_checkpoints/tracking_vemg2pose.ckpt
+  
+  # Tracking-specific settings
+  provide_initial_pos: true
+  predict_vel: true
+  state_condition: true
+  decoder: lstm  # LSTM decoder for temporal modeling
+
+# Data configuration (aligned with emg2pose)
+data:
+  # Full dataset location on Modal volume
+  # Note: Volume contents appear directly at mount point, not under volume name
+  data_dir: /persistent/emg2pose_data
+  # emg2pose uses 11790 = 10000 + 1790 (TDS left_context)
+  window_length: 11790
+  val_test_window_length: 11790
+  stride: 2000
+  
+  # Calibration - larger range for full training
+  calibration:
+    k_min: 0
+    k_max: 30
+  
+  # Session limits (null = use all)
+  train_sessions_limit: null
+  val_sessions_limit: null
+
+# Loss weights (aligned with emg2pose)
+loss_weights:
+  mae: 1.0
+  fingertip_distance: 0.01
+
+# Modal-specific settings
+modal:
+  gpu: H100
+  timeout_hours: 12
+  memory_mb: 262144 # 256GB RAM
+  volume_name: emg2pose-full-dataset
+
+# Output settings
+output:
+  dir: /persistent/react_outputs
+  save_predictions: true
+  commit_every: 1
+
+# Reproducibility (emg2pose default)
+seed: 42
