@@ -451,6 +451,7 @@ def train_react_emg(
         FiLMConditionedModel,
         FiLMConditionedModelConfig,
         load_pretrained_encoder,
+        load_pretrained_decoder,
     )
     from src.utils.data import create_lazy_datasets_from_metadata
     
@@ -543,6 +544,14 @@ def train_react_emg(
         device=str(device),
     )
     log("Encoder loaded successfully.")
+
+    # Load pretrained LSTM decoder (from same vemg2pose checkpoint)
+    log("Loading pretrained LSTM decoder...")
+    pretrained_decoder = load_pretrained_decoder(
+        checkpoint_path=str(checkpoint_path),
+        device=str(device),
+    )
+    log("Decoder loaded successfully.")
     
     # Create model
     log("\nCreating model...")
@@ -550,8 +559,13 @@ def train_react_emg(
         feature_dim=feature_dim,
         user_embedding_dim=user_embedding_dim,
         freeze_encoder=freeze_encoder,
+        freeze_decoder=freeze_encoder,  # decoder frozen when encoder is frozen
     )
-    model = FiLMConditionedModel(model_config, pretrained_encoder=pretrained_encoder).to(device)
+    model = FiLMConditionedModel(
+        model_config,
+        pretrained_encoder=pretrained_encoder,
+        pretrained_decoder=pretrained_decoder,
+    ).to(device)
     
     # Load checkpoint weights if resuming (skip Phase 1)
     skip_phase1 = False
@@ -599,8 +613,10 @@ def train_react_emg(
         try:
             model.user_encoder = torch.compile(model.user_encoder)
             model.film_layer = torch.compile(model.film_layer)
-            model.prediction_head = torch.compile(model.prediction_head)
-            log("torch.compile applied to user_encoder, film_layer, prediction_head")
+            if model.prediction_head is not None:
+                model.prediction_head = torch.compile(model.prediction_head)
+            log("torch.compile applied to user_encoder, film_layer" +
+                (", prediction_head" if model.prediction_head is not None else ""))
         except Exception as e:
             log(f"torch.compile failed (non-fatal): {e}")
     elif num_epochs_enc_unfreeze > 0:
@@ -847,16 +863,19 @@ def train_react_emg(
         
         # Allow gradients through encoder in forward pass
         model.config.freeze_encoder = False
+        # Also allow gradients through decoder
+        model.config.freeze_decoder = False
         
         # Distribute layer groups across unfreeze epochs
         groups_per_epoch = max(1, num_enc_layers // num_epochs_enc_unfreeze)
         
         # Build Phase 2 optimizer ONCE to preserve Adam momentum/variance
-        # across epochs.  Start with non-encoder params; encoder param
-        # groups are added as layers are unfrozen.
+        # across epochs.  Start with non-encoder, non-decoder params;
+        # encoder param groups are added as layers are unfrozen.
         non_encoder_params = [
             p for name, p in model.named_parameters()
-            if not name.startswith("encoder.") and p.requires_grad
+            if not name.startswith("encoder.") and not name.startswith("decoder.")
+            and p.requires_grad
         ]
         p2_param_groups = [{"params": non_encoder_params, "lr": lr}]
         
@@ -869,7 +888,15 @@ def train_react_emg(
                 "params": [],  # populated when unfrozen
                 "lr": layer_lr,
             })
-        
+
+        # Add a param group for the LSTM decoder (unfrozen together with
+        # the first encoder epoch, at enc_base_lr).
+        decoder_group_idx = len(p2_param_groups)
+        p2_param_groups.append({
+            "params": [],  # populated on first unfreeze epoch
+            "lr": enc_base_lr,
+        })
+
         p2_optimizer = torch.optim.AdamW(
             p2_param_groups,
             weight_decay=weight_decay,
@@ -914,6 +941,17 @@ def train_react_emg(
                 n_params = sum(p.numel() for p in layer.parameters())
                 log(f"  Unfroze encoder.layers[{orig_idx}] "
                     f"({type(layer).__name__}, {n_params:,} params)")
+
+            # Unfreeze decoder on the first Phase 2 epoch
+            if unfreeze_epoch == 0 and model.decoder is not None:
+                for param in model.decoder.parameters():
+                    param.requires_grad = True
+                p2_optimizer.param_groups[decoder_group_idx]["params"] = [
+                    p for p in model.decoder.parameters()
+                ]
+                dec_n = sum(p.numel() for p in model.decoder.parameters())
+                log(f"  Unfroze decoder (SequentialLSTM, {dec_n:,} params, "
+                    f"LR={enc_base_lr:.2e})")
             
             # Use the persistent Phase 2 optimizer (not rebuilt each epoch)
             optimizer = p2_optimizer
