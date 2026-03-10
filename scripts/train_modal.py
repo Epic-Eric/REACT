@@ -416,8 +416,18 @@ def train_react_emg(
     if not metadata_file.exists():
         raise FileNotFoundError(f"Dataset not found at {dataset_dir}")
     
+    # Resolve pretrained checkpoint from config
+    raw_ckpt = cfg.get("model", {}).get(
+        "pretrained_checkpoint",
+        "emg2pose_model_checkpoints/regression_vemg2pose.ckpt",
+    )
+    # Turn relative path into absolute using checkpoints dir
+    if not Path(raw_ckpt).is_absolute():
+        checkpoint_path = checkpoints_dir / Path(raw_ckpt).name
+    else:
+        checkpoint_path = Path(raw_ckpt)
+
     # Download checkpoints if needed
-    checkpoint_path = checkpoints_dir / "regression_vemg2pose.ckpt"
     if not checkpoint_path.exists():
         print("Downloading pretrained checkpoints...")
         archive = persistent_root / "emg2pose_model_checkpoints.tar.gz"
@@ -538,7 +548,7 @@ def train_react_emg(
     log(f"Val batches: {len(val_loader)}")
     
     # Load pretrained encoder
-    log("\nLoading pretrained encoder...")
+    log(f"\nLoading pretrained encoder from: {checkpoint_path}")
     pretrained_encoder = load_pretrained_encoder(
         checkpoint_path=str(checkpoint_path),
         device=str(device),
@@ -546,12 +556,13 @@ def train_react_emg(
     log("Encoder loaded successfully.")
 
     # Load pretrained LSTM decoder (from same vemg2pose checkpoint)
-    log("Loading pretrained LSTM decoder...")
+    log(f"Loading pretrained LSTM decoder from: {checkpoint_path}")
     pretrained_decoder = load_pretrained_decoder(
         checkpoint_path=str(checkpoint_path),
         device=str(device),
     )
-    log("Decoder loaded successfully.")
+    decoder_out = pretrained_decoder.mlp_out[1].out_features
+    log(f"Decoder loaded successfully (out_channels={decoder_out})")
     
     # Create model
     log("\nCreating model...")

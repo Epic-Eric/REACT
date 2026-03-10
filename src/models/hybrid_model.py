@@ -342,18 +342,31 @@ class FiLMConditionedModel(nn.Module):
         initial_pos = features_50.new_zeros(B, 20)  # 20 DOF
         preds = [initial_pos]
 
-        ctx_mgr = torch.no_grad() if cfg.freeze_decoder else torch.enable_grad()
-        with ctx_mgr:
-            for t in range(n_time):
-                feat_t = features_50[:, :, t]  # (B, C)
-                if cfg.state_condition:
-                    feat_t = torch.cat([feat_t, preds[-1]], dim=-1)  # (B, C+20)
+        # Determine whether decoder outputs pos+vel (out=40) or position-only (out=20)
+        # SequentialLSTM stores the output Linear in mlp_out[1]
+        decoder_out = self.decoder.mlp_out[1].out_features
+        has_velocity = (decoder_out == 2 * 20)  # 40 = pos(20) + vel(20)
 
-                output = self.decoder(feat_t)  # (B, 40) pos+vel
+        # NOTE: Do NOT wrap in torch.no_grad() even when the decoder is
+        # frozen.  The decoder params already have requires_grad=False which
+        # prevents weight-gradient accumulation.  Using torch.no_grad()
+        # would also kill gradients flowing through the *input* features
+        # (the FiLM-conditioned features), making it impossible to train
+        # the FiLM layer and user encoder.
+        for t in range(n_time):
+            feat_t = features_50[:, :, t]  # (B, C)
+            if cfg.state_condition:
+                feat_t = torch.cat([feat_t, preds[-1]], dim=-1)  # (B, C+20)
+
+            output = self.decoder(feat_t)  # (B, out_channels)
+
+            if has_velocity:
                 pos, vel = torch.split(output, output.shape[1] // 2, dim=1)
-
                 pred = pos if t < num_pos_steps else preds[-1] + vel
-                preds.append(pred)
+            else:
+                # Position-only decoder (e.g. tracking_vemg2pose, out=20)
+                pred = output
+            preds.append(pred)
 
         # Remove initial_pos; stack: (B, 20, n_time)
         return torch.stack(preds[1:], dim=-1)
@@ -784,11 +797,15 @@ def load_pretrained_decoder(
             f"Available keys: {[k for k in state_dict if 'decoder' in k.lower()][:10]}"
         )
 
-    # Recreate decoder architecture matching regression_vemg2pose config
+    # Infer architecture dimensions from checkpoint weights
+    out_channels = decoder_state["mlp_out.1.weight"].shape[0]  # 20 or 40
+    hidden_size = decoder_state["mlp_out.1.weight"].shape[1]   # 512
+    in_channels = decoder_state["lstm.weight_ih_l0"].shape[1]  # 84
+
     decoder = SequentialLSTM(
-        in_channels=84,     # 64 features + 20 state
-        out_channels=40,    # 20 position + 20 velocity
-        hidden_size=512,
+        in_channels=in_channels,
+        out_channels=out_channels,
+        hidden_size=hidden_size,
         num_layers=2,
         scale=0.01,
     )
