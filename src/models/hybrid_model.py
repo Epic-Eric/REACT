@@ -92,10 +92,15 @@ class FiLMConditionedModelConfig:
     freeze_decoder: bool = True
     pretrained_checkpoint: Optional[str] = None
     
-    # Decoder rollout config (matches VEMG2PoseWithInitialState defaults)
+    # Decoder rollout config
     num_position_steps: int = 500   # at 2 kHz; converted to rollout_freq internally
     rollout_freq: int = 50          # Hz
     state_condition: bool = True
+
+    # Tracking-specific: decoder outputs velocity, integrated as pred += vel
+    predict_vel: bool = False
+    # When True, initial_pos = ground-truth joint_angles[:, :, left_context]
+    provide_initial_pos: bool = False
 
 
 class TemporalPredictionHead(nn.Module):
@@ -307,17 +312,30 @@ class FiLMConditionedModel(nn.Module):
         self,
         features: torch.Tensor,
         emg_length: int,
+        initial_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the pretrained LSTM decoder at ``rollout_freq``.
 
-        Mirrors ``emg2pose.pose_modules.VEMG2PoseWithInitialState._predict_pose``.
+        Supports two decoder modes based on config:
+
+        **Tracking** (``predict_vel=True``, ``provide_initial_pos=True``):
+            Mirrors ``emg2pose.pose_modules.StatePoseModule._predict_pose``.
+            Decoder out_channels=20 (velocity).  Each step:
+            ``pred = decoder(input) + preds[-1]``.
+
+        **Regression** (``predict_vel=False``, ``provide_initial_pos=False``):
+            Mirrors ``emg2pose.pose_modules.VEMG2PoseWithInitialState._predict_pose``.
+            Decoder out_channels=40 (pos+vel).  First ``num_position_steps``
+            use direct position, then velocity integration.
 
         Args:
             features: FiLM-conditioned encoder features (B, C, L').
             emg_length: Original EMG sequence length (for computing duration).
+            initial_pos: Ground-truth initial pose (B, 20) when
+                ``provide_initial_pos=True``.  If None, uses zeros.
 
         Returns:
-            Pose predictions (B, 20, T_rollout).  T_rollout = seconds * rollout_freq.
+            Pose predictions (B, 20, T_rollout).
         """
         cfg = self.config
         B = features.shape[0]
@@ -335,17 +353,11 @@ class FiLMConditionedModel(nn.Module):
         # Reset decoder hidden state
         self.decoder.reset_state()
 
-        # Position steps at rollout frequency
-        num_pos_steps = round(cfg.num_position_steps * (cfg.rollout_freq / EMG_SAMPLE_RATE))
-
-        # Initial state = zeros (regression_vemg2pose uses provide_initial_pos=False)
-        initial_pos = features_50.new_zeros(B, 20)  # 20 DOF
-        preds = [initial_pos]
-
-        # Determine whether decoder outputs pos+vel (out=40) or position-only (out=20)
-        # SequentialLSTM stores the output Linear in mlp_out[1]
-        decoder_out = self.decoder.mlp_out[1].out_features
-        has_velocity = (decoder_out == 2 * 20)  # 40 = pos(20) + vel(20)
+        # Initial pose
+        if initial_pos is not None:
+            preds = [initial_pos]
+        else:
+            preds = [features_50.new_zeros(B, 20)]  # 20 DOF
 
         # NOTE: Do NOT wrap in torch.no_grad() even when the decoder is
         # frozen.  The decoder params already have requires_grad=False which
@@ -353,20 +365,32 @@ class FiLMConditionedModel(nn.Module):
         # would also kill gradients flowing through the *input* features
         # (the FiLM-conditioned features), making it impossible to train
         # the FiLM layer and user encoder.
-        for t in range(n_time):
-            feat_t = features_50[:, :, t]  # (B, C)
-            if cfg.state_condition:
-                feat_t = torch.cat([feat_t, preds[-1]], dim=-1)  # (B, C+20)
 
-            output = self.decoder(feat_t)  # (B, out_channels)
-
-            if has_velocity:
+        if cfg.predict_vel:
+            # ── Tracking mode (StatePoseModule) ──
+            # Decoder outputs velocity (out=20); integrate each step.
+            for t in range(n_time):
+                feat_t = features_50[:, :, t]  # (B, C)
+                if cfg.state_condition:
+                    feat_t = torch.cat([feat_t, preds[-1]], dim=-1)
+                vel = self.decoder(feat_t)          # (B, 20)
+                pred = vel + preds[-1]              # velocity integration
+                preds.append(pred)
+        else:
+            # ── Regression mode (VEMG2PoseWithInitialState) ──
+            # Decoder outputs pos+vel (out=40); first N steps use pos,
+            # then velocity integration thereafter.
+            num_pos_steps = round(
+                cfg.num_position_steps * (cfg.rollout_freq / EMG_SAMPLE_RATE)
+            )
+            for t in range(n_time):
+                feat_t = features_50[:, :, t]  # (B, C)
+                if cfg.state_condition:
+                    feat_t = torch.cat([feat_t, preds[-1]], dim=-1)
+                output = self.decoder(feat_t)   # (B, 40)
                 pos, vel = torch.split(output, output.shape[1] // 2, dim=1)
                 pred = pos if t < num_pos_steps else preds[-1] + vel
-            else:
-                # Position-only decoder (e.g. tracking_vemg2pose, out=20)
-                pred = output
-            preds.append(pred)
+                preds.append(pred)
 
         # Remove initial_pos; stack: (B, 20, n_time)
         return torch.stack(preds[1:], dim=-1)
@@ -377,6 +401,7 @@ class FiLMConditionedModel(nn.Module):
         calibration_features: torch.Tensor,
         num_calibration_samples: torch.Tensor,
         calibration_lengths: Optional[torch.Tensor] = None,
+        initial_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with pre-encoded calibration recordings.
 
@@ -386,6 +411,8 @@ class FiLMConditionedModel(nn.Module):
                                  (B, K_max, C, L_cal).
             num_calibration_samples: Number of actual samples per batch item (B,).
             calibration_lengths: Actual lengths of calibration recordings (B, K_max).
+            initial_pos: Ground-truth initial pose (B, 20) for tracking mode.
+                         Required when ``provide_initial_pos=True``.
 
         Returns:
             Pose predictions of shape (B, 20, T).  If the LSTM decoder is
@@ -407,7 +434,7 @@ class FiLMConditionedModel(nn.Module):
 
         # Predict poses
         if self.decoder is not None:
-            return self._decoder_rollout(conditioned_features, emg.shape[-1])
+            return self._decoder_rollout(conditioned_features, emg.shape[-1], initial_pos)
         else:
             return self.prediction_head(conditioned_features)
     
@@ -417,6 +444,7 @@ class FiLMConditionedModel(nn.Module):
         calibration_emg: torch.Tensor,
         num_calibration_samples: torch.Tensor,
         calibration_lengths: Optional[torch.Tensor] = None,
+        initial_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass encoding calibration recordings on-the-fly.
         
@@ -425,6 +453,7 @@ class FiLMConditionedModel(nn.Module):
             calibration_emg: Raw calibration EMG (B, K_max, 16, L_cal).
             num_calibration_samples: Number of actual samples per batch item (B,).
             calibration_lengths: Actual lengths (B, K_max).
+            initial_pos: Ground-truth initial pose (B, 20) for tracking mode.
         
         Returns:
             Pose predictions of shape (B, out_channels, L').
@@ -457,7 +486,7 @@ class FiLMConditionedModel(nn.Module):
 
         # Predict poses
         if self.decoder is not None:
-            return self._decoder_rollout(conditioned_features, emg.shape[-1])
+            return self._decoder_rollout(conditioned_features, emg.shape[-1], initial_pos)
         else:
             return self.prediction_head(conditioned_features)
 
@@ -465,6 +494,7 @@ class FiLMConditionedModel(nn.Module):
         self,
         emg: torch.Tensor,
         calibration_recordings: List[List[torch.Tensor]],
+        initial_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with variable-length FULL calibration recordings.
         
@@ -548,7 +578,7 @@ class FiLMConditionedModel(nn.Module):
 
         # Predict poses
         if self.decoder is not None:
-            return self._decoder_rollout(conditioned_features, emg.shape[-1])
+            return self._decoder_rollout(conditioned_features, emg.shape[-1], initial_pos)
         else:
             return self.prediction_head(conditioned_features)
 

@@ -355,6 +355,7 @@ def train_react_emg(
     feature_dim = int(cfg["model"]["feature_dim"])
     user_embedding_dim = int(cfg["model"]["user_embedding_dim"])
     freeze_encoder = bool(cfg["model"]["freeze_encoder"])
+    model_cfg = cfg.get("model", {})
     
     seed = int(cfg.get("seed", 42))
     commit_every = int(cfg["output"].get("commit_every", 10))
@@ -571,7 +572,13 @@ def train_react_emg(
         user_embedding_dim=user_embedding_dim,
         freeze_encoder=freeze_encoder,
         freeze_decoder=freeze_encoder,  # decoder frozen when encoder is frozen
+        predict_vel=model_cfg.get("predict_vel", False),
+        provide_initial_pos=model_cfg.get("provide_initial_pos", False),
+        state_condition=model_cfg.get("state_condition", True),
     )
+    log(f"  predict_vel={model_config.predict_vel}, "
+        f"provide_initial_pos={model_config.provide_initial_pos}, "
+        f"state_condition={model_config.state_condition}")
     model = FiLMConditionedModel(
         model_config,
         pretrained_encoder=pretrained_encoder,
@@ -700,6 +707,13 @@ def train_react_emg(
             calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
             calibration_k = batch["calibration_k"].to(device, non_blocking=True)
             
+            # Extract initial position for tracking mode (provide_initial_pos)
+            # Matches emg2pose: initial_pos = joint_angles[..., left_context]
+            if model_config.provide_initial_pos:
+                init_pos = targets[:, :, left_context].detach()  # (B, 20)
+            else:
+                init_pos = None
+            
             optimizer.zero_grad()
             
             try:
@@ -709,6 +723,7 @@ def train_react_emg(
                         emg=emg,
                         calibration_features=calibration_features,
                         num_calibration_samples=calibration_k,
+                        initial_pos=init_pos,
                     )
                     
                     # Trim targets for encoder left/right context
@@ -772,12 +787,18 @@ def train_react_emg(
                 calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
                 calibration_k = batch["calibration_k"].to(device, non_blocking=True)
                 
+                if model_config.provide_initial_pos:
+                    init_pos = targets[:, :, left_context]
+                else:
+                    init_pos = None
+                
                 try:
                     with torch.cuda.amp.autocast(enabled=use_amp):
                         predictions = model(
                             emg=emg,
                             calibration_features=calibration_features,
                             num_calibration_samples=calibration_k,
+                            initial_pos=init_pos,
                         )
                         
                         start = left_context
@@ -993,6 +1014,11 @@ def train_react_emg(
                 calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
                 calibration_k = batch["calibration_k"].to(device, non_blocking=True)
                 
+                if model_config.provide_initial_pos:
+                    init_pos = targets[:, :, left_context].detach()
+                else:
+                    init_pos = None
+                
                 optimizer.zero_grad()
                 
                 try:
@@ -1002,6 +1028,7 @@ def train_react_emg(
                             emg=emg,
                             calibration_features=calibration_features,
                             num_calibration_samples=calibration_k,
+                            initial_pos=init_pos,
                         )
                         
                         start = left_context
@@ -1067,12 +1094,18 @@ def train_react_emg(
                     calibration_features = batch["calibration_emg"].to(device, non_blocking=True)
                     calibration_k = batch["calibration_k"].to(device, non_blocking=True)
                     
+                    if model_config.provide_initial_pos:
+                        init_pos = targets[:, :, left_context]
+                    else:
+                        init_pos = None
+                    
                     try:
                         with torch.cuda.amp.autocast(enabled=use_amp):
                             predictions = model(
                                 emg=emg,
                                 calibration_features=calibration_features,
                                 num_calibration_samples=calibration_k,
+                                initial_pos=init_pos,
                             )
                             
                             start = left_context
