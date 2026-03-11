@@ -366,6 +366,12 @@ def train_react_emg(
     enc_base_lr = float(enc_unfreeze_cfg.get("base_lr", 1e-4))
     enc_lr_decay = float(enc_unfreeze_cfg.get("lr_decay", 0.5))
     
+    # Warmup config (linear warmup from 0 to base LR)
+    warmup_steps = int(cfg["training"].get("warmup_steps", 0))
+    
+    # Embedding diversity loss weight (VICReg-style variance regularization)
+    diversity_loss_weight = float(cfg["training"].get("diversity_loss_weight", 0.1))
+
     total_epochs = num_epochs + num_epochs_enc_unfreeze
     
     train_sessions_limit = cfg["data"].get("train_sessions_limit")
@@ -481,6 +487,10 @@ def train_react_emg(
     log(f"  Batch size: {batch_size}")
     log(f"  Learning rate: {lr}")
     log(f"  Weight decay: {weight_decay}")
+    if warmup_steps > 0:
+        log(f"  LR warmup steps: {warmup_steps}")
+    if diversity_loss_weight > 0:
+        log(f"  Embedding diversity loss weight: {diversity_loss_weight}")
     if num_epochs_enc_unfreeze > 0:
         log(f"  Encoder unfreeze base LR: {enc_base_lr}")
         log(f"  Encoder layerwise LR decay: {enc_lr_decay}")
@@ -659,6 +669,12 @@ def train_react_emg(
     )
     criterion = nn.L1Loss()  # MAE loss (matches emg2pose baseline)
     
+    # Warmup helper: linearly ramp LR from 0 to base_lr over warmup_steps
+    p1_global_step = 0
+    p2_global_step = 0
+    if warmup_steps > 0:
+        log(f"LR warmup: {warmup_steps} steps (linear ramp to base LR)")
+    
     # Get encoder context for proper target alignment
     left_context = getattr(model.encoder, 'left_context', 0)
     right_context = getattr(model.encoder, 'right_context', 0)
@@ -719,11 +735,12 @@ def train_react_emg(
             try:
                 fwd_start = time.perf_counter()
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    predictions = model(
+                    predictions, user_emb = model(
                         emg=emg,
                         calibration_features=calibration_features,
                         num_calibration_samples=calibration_k,
                         initial_pos=init_pos,
+                        return_embeddings=True,
                     )
                     
                     # Trim targets for encoder left/right context
@@ -742,9 +759,18 @@ def train_react_emg(
                     # Apply IK failure mask (only train on valid frames)
                     mask = mask_trimmed.unsqueeze(1).expand_as(predictions)
                     if mask.any():
-                        loss = criterion(predictions[mask], targets_trimmed[mask])
+                        mae_loss = criterion(predictions[mask], targets_trimmed[mask])
                     else:
                         continue  # skip batch with no valid frames
+
+                    # Embedding diversity loss (VICReg-style variance)
+                    # Push per-dimension std above 1 to prevent collapse
+                    if diversity_loss_weight > 0 and user_emb.shape[0] > 1:
+                        emb_std = user_emb.std(dim=0)  # (D,)
+                        div_loss = torch.mean(nn.functional.relu(1.0 - emb_std))
+                        loss = mae_loss + diversity_loss_weight * div_loss
+                    else:
+                        loss = mae_loss
                 
                 fwd_time = time.perf_counter() - fwd_start
                 bwd_start = time.perf_counter()
@@ -755,16 +781,31 @@ def train_react_emg(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
+                
+                # LR warmup (override scheduler LR during warmup)
+                p1_global_step += 1
+                if warmup_steps > 0 and p1_global_step <= warmup_steps:
+                    warmup_lr = lr * p1_global_step / warmup_steps
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = warmup_lr
+                
                 bwd_time = time.perf_counter() - bwd_start
                 step_total_time = time.perf_counter() - step_start
                 epoch_losses.append(loss.item())
 
                 if batch_idx % 10 == 0:
+                    cur_lr = optimizer.param_groups[0]["lr"]
+                    # Log embedding stats every 100 batches for diagnostics
+                    emb_info = ""
+                    if batch_idx % 100 == 0 and user_emb is not None:
+                        emb_norm = user_emb.norm(dim=-1).mean().item()
+                        emb_std_mean = user_emb.std(dim=0).mean().item()
+                        emb_info = f" | Emb norm: {emb_norm:.3f} std: {emb_std_mean:.3f}"
                     log(
                         f"Epoch {epoch+1} [{batch_idx:4d}/{len(train_loader)}] | "
-                        f"Loss: {loss.item():.4f} | "
+                        f"Loss: {loss.item():.4f} | LR: {cur_lr:.2e} | "
                         f"Data: {data_time:.3f}s | Fwd: {fwd_time:.3f}s | Bwd: {bwd_time:.3f}s | "
-                        f"Total: {step_total_time:.3f}s"
+                        f"Total: {step_total_time:.3f}s{emb_info}"
                     )
                 data_start = time.perf_counter()
                 
@@ -947,6 +988,15 @@ def train_react_emg(
                 transferred += 1
         log(f"Phase 2 optimizer created (transferred {transferred}/{len(non_encoder_params)} param states from Phase 1)")
         
+        # Phase 2 cosine annealing scheduler (decays all param groups)
+        p2_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            p2_optimizer,
+            T_max=num_epochs_enc_unfreeze,
+            eta_min=min_lr,
+        )
+        # Store target LRs for warmup (before scheduler modifies them)
+        p2_target_lrs = [g["lr"] for g in p2_optimizer.param_groups]
+        
         for unfreeze_epoch in range(num_epochs_enc_unfreeze):
             global_epoch = num_epochs + unfreeze_epoch
             epoch_start = time.time()
@@ -1024,11 +1074,12 @@ def train_react_emg(
                 try:
                     fwd_start = time.perf_counter()
                     with torch.cuda.amp.autocast(enabled=use_amp):
-                        predictions = model(
+                        predictions, user_emb = model(
                             emg=emg,
                             calibration_features=calibration_features,
                             num_calibration_samples=calibration_k,
                             initial_pos=init_pos,
+                            return_embeddings=True,
                         )
                         
                         start = left_context
@@ -1044,9 +1095,17 @@ def train_react_emg(
                         
                         mask = mask_trimmed.unsqueeze(1).expand_as(predictions)
                         if mask.any():
-                            loss = criterion(predictions[mask], targets_trimmed[mask])
+                            mae_loss = criterion(predictions[mask], targets_trimmed[mask])
                         else:
                             continue
+
+                        # Embedding diversity loss
+                        if diversity_loss_weight > 0 and user_emb.shape[0] > 1:
+                            emb_std = user_emb.std(dim=0)
+                            div_loss = torch.mean(nn.functional.relu(1.0 - emb_std))
+                            loss = mae_loss + diversity_loss_weight * div_loss
+                        else:
+                            loss = mae_loss
                     
                     fwd_time = time.perf_counter() - fwd_start
                     bwd_start = time.perf_counter()
@@ -1057,6 +1116,14 @@ def train_react_emg(
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     scaler.step(optimizer)
                     scaler.update()
+                    
+                    # Phase 2 LR warmup (first unfreeze epoch only)
+                    p2_global_step += 1
+                    if warmup_steps > 0 and p2_global_step <= warmup_steps:
+                        warmup_frac = p2_global_step / warmup_steps
+                        for i, pg in enumerate(optimizer.param_groups):
+                            pg["lr"] = p2_target_lrs[i] * warmup_frac
+                    
                     bwd_time = time.perf_counter() - bwd_start
                     step_total_time = time.perf_counter() - step_start
                     epoch_losses.append(loss.item())
@@ -1132,12 +1199,15 @@ def train_react_emg(
             val_losses.append(avg_val_loss)
             phase_labels.append("phase2")
             
+            p2_scheduler.step()
             epoch_time = time.time() - epoch_start
             
+            p2_lr_str = ", ".join(f"{g['lr']:.2e}" for g in optimizer.param_groups[:3])
             log(
                 f"Epoch {global_epoch + 1:3d}/{total_epochs} [Phase 2] | "
                 f"Train: {avg_train_loss:.4f} | "
                 f"Val: {avg_val_loss:.4f} | "
+                f"LRs: [{p2_lr_str}, ...] | "
                 f"Time: {epoch_time:.1f}s"
             )
             
