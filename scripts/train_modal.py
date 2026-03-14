@@ -369,9 +369,6 @@ def train_react_emg(
     # Warmup config (linear warmup from 0 to base LR)
     warmup_steps = int(cfg["training"].get("warmup_steps", 0))
     
-    # Embedding diversity loss weight (VICReg-style variance regularization)
-    diversity_loss_weight = float(cfg["training"].get("diversity_loss_weight", 0.1))
-
     total_epochs = num_epochs + num_epochs_enc_unfreeze
     
     train_sessions_limit = cfg["data"].get("train_sessions_limit")
@@ -489,8 +486,6 @@ def train_react_emg(
     log(f"  Weight decay: {weight_decay}")
     if warmup_steps > 0:
         log(f"  LR warmup steps: {warmup_steps}")
-    if diversity_loss_weight > 0:
-        log(f"  Embedding diversity loss weight: {diversity_loss_weight}")
     if num_epochs_enc_unfreeze > 0:
         log(f"  Encoder unfreeze base LR: {enc_base_lr}")
         log(f"  Encoder layerwise LR decay: {enc_lr_decay}")
@@ -735,12 +730,11 @@ def train_react_emg(
             try:
                 fwd_start = time.perf_counter()
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    predictions, user_emb = model(
+                    predictions = model(
                         emg=emg,
                         calibration_features=calibration_features,
                         num_calibration_samples=calibration_k,
                         initial_pos=init_pos,
-                        return_embeddings=True,
                     )
                     
                     # Trim targets for encoder left/right context
@@ -759,18 +753,9 @@ def train_react_emg(
                     # Apply IK failure mask (only train on valid frames)
                     mask = mask_trimmed.unsqueeze(1).expand_as(predictions)
                     if mask.any():
-                        mae_loss = criterion(predictions[mask], targets_trimmed[mask])
+                        loss = criterion(predictions[mask], targets_trimmed[mask])
                     else:
                         continue  # skip batch with no valid frames
-
-                    # Embedding diversity loss (VICReg-style variance)
-                    # Push per-dimension std above 1 to prevent collapse
-                    if diversity_loss_weight > 0 and user_emb.shape[0] > 1:
-                        emb_std = user_emb.std(dim=0)  # (D,)
-                        div_loss = torch.mean(nn.functional.relu(1.0 - emb_std))
-                        loss = mae_loss + diversity_loss_weight * div_loss
-                    else:
-                        loss = mae_loss
                 
                 fwd_time = time.perf_counter() - fwd_start
                 bwd_start = time.perf_counter()
@@ -795,17 +780,11 @@ def train_react_emg(
 
                 if batch_idx % 10 == 0:
                     cur_lr = optimizer.param_groups[0]["lr"]
-                    # Log embedding stats every 100 batches for diagnostics
-                    emb_info = ""
-                    if batch_idx % 100 == 0 and user_emb is not None:
-                        emb_norm = user_emb.norm(dim=-1).mean().item()
-                        emb_std_mean = user_emb.std(dim=0).mean().item()
-                        emb_info = f" | Emb norm: {emb_norm:.3f} std: {emb_std_mean:.3f}"
                     log(
                         f"Epoch {epoch+1} [{batch_idx:4d}/{len(train_loader)}] | "
                         f"Loss: {loss.item():.4f} | LR: {cur_lr:.2e} | "
                         f"Data: {data_time:.3f}s | Fwd: {fwd_time:.3f}s | Bwd: {bwd_time:.3f}s | "
-                        f"Total: {step_total_time:.3f}s{emb_info}"
+                        f"Total: {step_total_time:.3f}s"
                     )
                 data_start = time.perf_counter()
                 
@@ -1074,12 +1053,11 @@ def train_react_emg(
                 try:
                     fwd_start = time.perf_counter()
                     with torch.cuda.amp.autocast(enabled=use_amp):
-                        predictions, user_emb = model(
+                        predictions = model(
                             emg=emg,
                             calibration_features=calibration_features,
                             num_calibration_samples=calibration_k,
                             initial_pos=init_pos,
-                            return_embeddings=True,
                         )
                         
                         start = left_context
@@ -1095,17 +1073,9 @@ def train_react_emg(
                         
                         mask = mask_trimmed.unsqueeze(1).expand_as(predictions)
                         if mask.any():
-                            mae_loss = criterion(predictions[mask], targets_trimmed[mask])
+                            loss = criterion(predictions[mask], targets_trimmed[mask])
                         else:
                             continue
-
-                        # Embedding diversity loss
-                        if diversity_loss_weight > 0 and user_emb.shape[0] > 1:
-                            emb_std = user_emb.std(dim=0)
-                            div_loss = torch.mean(nn.functional.relu(1.0 - emb_std))
-                            loss = mae_loss + diversity_loss_weight * div_loss
-                        else:
-                            loss = mae_loss
                     
                     fwd_time = time.perf_counter() - fwd_start
                     bwd_start = time.perf_counter()

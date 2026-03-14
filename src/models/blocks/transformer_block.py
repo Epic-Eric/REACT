@@ -198,20 +198,12 @@ class TransformerGroupEncoder(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights for stable but expressive training.
-
-        Previous gain=0.02 caused near-zero outputs regardless of input,
-        making user embeddings ≈ 0 and FiLM conditioning non-functional.
-        Standard Xavier (gain=1.0) ensures meaningful forward signal.
-        """
+        """Initialize weights with small values for stable training."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=1.0)
+                nn.init.xavier_uniform_(module.weight, gain=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        # Scale down output projection to avoid large initial embeddings
-        nn.init.xavier_uniform_(self.output_proj.weight, gain=0.1)
-        nn.init.zeros_(self.output_proj.bias)
     
     def forward(
         self,

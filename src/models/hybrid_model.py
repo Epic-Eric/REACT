@@ -254,34 +254,6 @@ class FiLMConditionedModel(nn.Module):
         # FiLM conditioning layer
         self.film_layer = FiLMLayer(config.film)
 
-        # ── Multi-scale decoder conditioning ────────────────────────────
-        # (1) Project user embedding → LSTM initial hidden state (h0, c0)
-        # This gives the decoder a user-specific starting point.
-        if pretrained_decoder is not None:
-            lstm_hidden = pretrained_decoder.hidden_size
-            lstm_layers = pretrained_decoder.num_layers
-            self.state_proj = nn.Sequential(
-                nn.Linear(config.user_embedding_dim, lstm_hidden),
-                nn.Tanh(),
-                nn.Linear(lstm_hidden, lstm_hidden * lstm_layers * 2),
-            )
-            # Initialize small so LSTM starts near zeros (pretrained behavior)
-            nn.init.zeros_(self.state_proj[-1].weight)
-            nn.init.zeros_(self.state_proj[-1].bias)
-        else:
-            self.state_proj = None
-
-        # (2) Per-step feature adapter: residual injection of user info
-        # at each decoder timestep.  Starts at zero (identity) and learns
-        # to inject user information gradually.
-        self.feature_adapter = nn.Sequential(
-            nn.Linear(config.user_embedding_dim, config.feature_dim),
-            nn.Tanh(),
-            nn.Linear(config.feature_dim, config.feature_dim),
-        )
-        nn.init.zeros_(self.feature_adapter[-1].weight)
-        nn.init.zeros_(self.feature_adapter[-1].bias)
-
         # Track context requirements from encoder
         self.left_context = 0
         self.right_context = 0
@@ -341,7 +313,6 @@ class FiLMConditionedModel(nn.Module):
         features: torch.Tensor,
         emg_length: int,
         initial_pos: Optional[torch.Tensor] = None,
-        user_embedding: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the pretrained LSTM decoder at ``rollout_freq``.
 
@@ -357,16 +328,11 @@ class FiLMConditionedModel(nn.Module):
             Decoder out_channels=40 (pos+vel).  First ``num_position_steps``
             use direct position, then velocity integration.
 
-        Multi-scale user conditioning (when ``user_embedding`` is provided):
-            1. LSTM initial hidden state set from projected user embedding
-            2. Per-step feature adaptation via residual user injection
-
         Args:
             features: FiLM-conditioned encoder features (B, C, L').
             emg_length: Original EMG sequence length (for computing duration).
             initial_pos: Ground-truth initial pose (B, 20) when
                 ``provide_initial_pos=True``.  If None, uses zeros.
-            user_embedding: User embedding (B, D) for decoder conditioning.
 
         Returns:
             Pose predictions (B, 20, T_rollout).
@@ -384,26 +350,8 @@ class FiLMConditionedModel(nn.Module):
             features, size=n_time, mode="linear", align_corners=True,
         )  # (B, C, n_time)
 
-        # ── Initialize LSTM state from user embedding ────────────────
-        if user_embedding is not None and self.state_proj is not None:
-            state_vec = self.state_proj(user_embedding)  # (B, H*L*2)
-            h_size = self.decoder.hidden_size
-            n_layers = self.decoder.num_layers
-            h0 = state_vec[:, :h_size * n_layers].reshape(
-                n_layers, B, h_size
-            ).contiguous()
-            c0 = state_vec[:, h_size * n_layers:].reshape(
-                n_layers, B, h_size
-            ).contiguous()
-            self.decoder.hidden = (h0, c0)
-        else:
-            self.decoder.reset_state()
-
-        # ── Pre-compute per-step feature bias from user embedding ────
-        if user_embedding is not None and self.feature_adapter is not None:
-            feat_bias = self.feature_adapter(user_embedding)  # (B, C)
-        else:
-            feat_bias = None
+        # Reset decoder hidden state
+        self.decoder.reset_state()
 
         # Initial pose
         if initial_pos is not None:
@@ -423,8 +371,6 @@ class FiLMConditionedModel(nn.Module):
             # Decoder outputs velocity (out=20); integrate each step.
             for t in range(n_time):
                 feat_t = features_50[:, :, t]  # (B, C)
-                if feat_bias is not None:
-                    feat_t = feat_t + feat_bias
                 if cfg.state_condition:
                     feat_t = torch.cat([feat_t, preds[-1]], dim=-1)
                 vel = self.decoder(feat_t)          # (B, 20)
@@ -439,8 +385,6 @@ class FiLMConditionedModel(nn.Module):
             )
             for t in range(n_time):
                 feat_t = features_50[:, :, t]  # (B, C)
-                if feat_bias is not None:
-                    feat_t = feat_t + feat_bias
                 if cfg.state_condition:
                     feat_t = torch.cat([feat_t, preds[-1]], dim=-1)
                 output = self.decoder(feat_t)   # (B, 40)
@@ -458,8 +402,7 @@ class FiLMConditionedModel(nn.Module):
         num_calibration_samples: torch.Tensor,
         calibration_lengths: Optional[torch.Tensor] = None,
         initial_pos: Optional[torch.Tensor] = None,
-        return_embeddings: bool = False,
-    ):
+    ) -> torch.Tensor:
         """Forward pass with pre-encoded calibration recordings.
 
         Args:
@@ -470,12 +413,11 @@ class FiLMConditionedModel(nn.Module):
             calibration_lengths: Actual lengths of calibration recordings (B, K_max).
             initial_pos: Ground-truth initial pose (B, 20) for tracking mode.
                          Required when ``provide_initial_pos=True``.
-            return_embeddings: If True, also return user embeddings (for
-                              auxiliary losses like diversity regularization).
 
         Returns:
-            Pose predictions of shape (B, 20, T), or a tuple
-            (predictions, user_embeddings) when ``return_embeddings=True``.
+            Pose predictions of shape (B, 20, T).  If the LSTM decoder is
+            present T corresponds to the rollout length; otherwise T = L'
+            (encoder output length).
         """
         # Encode main recording
         features = self.encode(emg)  # (B, C, L')
@@ -490,18 +432,11 @@ class FiLMConditionedModel(nn.Module):
         # Apply FiLM conditioning
         conditioned_features = self.film_layer(features, user_embeddings)
 
-        # Predict poses (with multi-scale user conditioning in decoder)
+        # Predict poses
         if self.decoder is not None:
-            preds = self._decoder_rollout(
-                conditioned_features, emg.shape[-1], initial_pos,
-                user_embedding=user_embeddings,
-            )
+            return self._decoder_rollout(conditioned_features, emg.shape[-1], initial_pos)
         else:
-            preds = self.prediction_head(conditioned_features)
-
-        if return_embeddings:
-            return preds, user_embeddings
-        return preds
+            return self.prediction_head(conditioned_features)
     
     def forward_with_raw_calibration(
         self,
@@ -551,10 +486,7 @@ class FiLMConditionedModel(nn.Module):
 
         # Predict poses
         if self.decoder is not None:
-            return self._decoder_rollout(
-                conditioned_features, emg.shape[-1], initial_pos,
-                user_embedding=user_embeddings,
-            )
+            return self._decoder_rollout(conditioned_features, emg.shape[-1], initial_pos)
         else:
             return self.prediction_head(conditioned_features)
 
@@ -646,10 +578,7 @@ class FiLMConditionedModel(nn.Module):
 
         # Predict poses
         if self.decoder is not None:
-            return self._decoder_rollout(
-                conditioned_features, emg.shape[-1], initial_pos,
-                user_embedding=user_embeddings,
-            )
+            return self._decoder_rollout(conditioned_features, emg.shape[-1], initial_pos)
         else:
             return self.prediction_head(conditioned_features)
 
