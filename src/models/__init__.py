@@ -6,6 +6,7 @@ from .blocks import (
     CharacteristicCNN,
     AttentionScorer,
     TemporalAttentionPooling,
+    GRUTemporalPooling,
     TransformerGroupEncoder,
 )
 from .user_encoder import UserEncoder, UserEncoderConfig
@@ -20,6 +21,7 @@ __all__ = [
     "CharacteristicCNN",
     "AttentionScorer",
     "TemporalAttentionPooling",
+    "GRUTemporalPooling",
     "TransformerGroupEncoder",
     "UserEncoder",
     "UserEncoderConfig",

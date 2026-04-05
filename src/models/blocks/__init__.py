@@ -9,6 +9,7 @@ from .attention_scorer import (
     TemporalAttentionPooling,
     TemporalAttentionPoolingConfig,
 )
+from .gru_pooling import GRUTemporalPooling, GRUTemporalPoolingConfig
 from .transformer_block import TransformerGroupEncoder, TransformerGroupEncoderConfig
 
 __all__ = [
@@ -20,6 +21,8 @@ __all__ = [
     "AttentionScorerConfig",
     "TemporalAttentionPooling",
     "TemporalAttentionPoolingConfig",
+    "GRUTemporalPooling",
+    "GRUTemporalPoolingConfig",
     "TransformerGroupEncoder",
     "TransformerGroupEncoderConfig",
 ]

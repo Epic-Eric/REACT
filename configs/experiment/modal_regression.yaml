@@ -1,3 +1,4 @@
+# modal run --detach scripts/train_modal.py::main --config tracking
 # Modal cloud training - REGRESSION mode
 # Aligned with emg2pose/config/experiment/regression_vemg2pose.yaml
 #
@@ -58,6 +59,16 @@ model:
   # Regression-specific settings
   provide_initial_pos: false
   state_condition: true
+
+  # User encoder settings
+  user_encoder:
+    pooling_method: "gru"  # "attention" or "gru"
+    gru_pooling:
+      in_channels: 64
+      hidden_size: 64
+      num_layers: 3
+      bidirectional: true
+      dropout: 0.1
 
 # Data configuration (aligned with emg2pose)
 data:

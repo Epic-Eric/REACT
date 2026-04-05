@@ -63,6 +63,16 @@ model:
   state_condition: true
   decoder: lstm  # LSTM decoder for temporal modeling
 
+  # User encoder settings
+  user_encoder:
+    pooling_method: "gru"  # "attention" or "gru"
+    gru_pooling:
+      in_channels: 64
+      hidden_size: 64
+      num_layers: 3
+      bidirectional: true
+      dropout: 0.1
+
 # Data configuration (aligned with emg2pose)
 data:
   # Full dataset location on Modal volume

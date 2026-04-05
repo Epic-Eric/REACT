@@ -27,6 +27,8 @@ from .blocks import (
     CharacteristicCNNConfig,
     TemporalAttentionPooling,
     TemporalAttentionPoolingConfig,
+    GRUTemporalPooling,
+    GRUTemporalPoolingConfig,
     TransformerGroupEncoder,
     TransformerGroupEncoderConfig,
 )
@@ -38,13 +40,16 @@ class UserEncoderConfig:
     
     Attributes:
         feature_dim: Feature dimension from pretrained encoder.
+        pooling_method: Temporal pooling strategy — "attention" or "gru".
         characteristic_cnn: Configuration for characteristic CNN.
         attention_pooling: Configuration for temporal attention pooling.
+        gru_pooling: Configuration for GRU temporal pooling.
         group_encoder: Configuration for transformer group encoder.
         max_calibration_samples: Maximum number of calibration recordings.
         zero_embedding_dim: Dimension for zero-sample fallback embedding.
     """
     feature_dim: int = 64
+    pooling_method: str = "gru"  # "attention" | "gru"
     
     # Sub-module configs with defaults
     characteristic_cnn: CharacteristicCNNConfig = field(
@@ -63,6 +68,15 @@ class UserEncoderConfig:
             scorer_hidden=32,
             scorer_layers=2,
             temperature=1.0,
+            dropout=0.1,
+        )
+    )
+    gru_pooling: GRUTemporalPoolingConfig = field(
+        default_factory=lambda: GRUTemporalPoolingConfig(
+            in_channels=64,
+            hidden_size=64,
+            num_layers=3,
+            bidirectional=True,
             dropout=0.1,
         )
     )
@@ -99,8 +113,16 @@ class UserEncoder(nn.Module):
         # Characteristic CNN for extracting user-specific patterns
         self.characteristic_cnn = CharacteristicCNN(config.characteristic_cnn)
         
-        # Temporal attention pooling for each recording
-        self.attention_pooling = TemporalAttentionPooling(config.attention_pooling)
+        # Temporal pooling for each recording (modular: attention or GRU)
+        if config.pooling_method == "gru":
+            self.temporal_pooling = GRUTemporalPooling(config.gru_pooling)
+        elif config.pooling_method == "attention":
+            self.temporal_pooling = TemporalAttentionPooling(config.attention_pooling)
+        else:
+            raise ValueError(
+                f"Unknown pooling_method '{config.pooling_method}'. "
+                "Choose 'attention' or 'gru'."
+            )
         
         # Transformer for aggregating across recordings
         self.group_encoder = TransformerGroupEncoder(config.group_encoder)
@@ -142,7 +164,7 @@ class UserEncoder(nn.Module):
             
             # Pool to fixed size: (1, C)
             mask = recording_masks[i].unsqueeze(0) if recording_masks else None
-            pooled = self.attention_pooling(char_features, mask)
+            pooled = self.temporal_pooling(char_features, mask)
             
             pooled_features.append(pooled.squeeze(0))  # (C,)
         
@@ -216,7 +238,7 @@ class UserEncoder(nn.Module):
             seq_mask = None
         
         # Pool each recording: (B*K_max, C)
-        pooled_flat = self.attention_pooling(char_features_flat, seq_mask)
+        pooled_flat = self.temporal_pooling(char_features_flat, seq_mask)
         
         # Reshape back: (B, K_max, C)
         calibration_block = pooled_flat.view(B, K_max, C)

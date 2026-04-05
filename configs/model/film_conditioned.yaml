@@ -12,6 +12,9 @@ num_joints: 20
 
 # User encoder configuration
 user_encoder:
+  # Temporal pooling method: "attention" or "gru"
+  pooling_method: "gru"
+
   # Characteristic CNN config
   characteristic_cnn:
     input_dim: 64
@@ -20,13 +23,21 @@ user_encoder:
     kernel_size: 3
     dropout: 0.1
   
-  # Attention scorer config
+  # Attention scorer config (used when pooling_method: "attention")
   attention_scorer:
     input_dim: 64
     hidden_dim: 32
     num_heads: 4
     dropout: 0.1
     temperature: 1.0
+  
+  # GRU pooling config (used when pooling_method: "gru")
+  gru_pooling:
+    in_channels: 64
+    hidden_size: 64
+    num_layers: 3
+    bidirectional: true
+    dropout: 0.1
   
   # Transformer group encoder config
   group_encoder:

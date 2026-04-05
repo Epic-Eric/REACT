@@ -543,8 +543,8 @@ class FiLMConditionedModel(nn.Module):
                             rec_features
                         )  # (1, C, L_i')
                         
-                        # Pool via temporal attention to get fixed-size vector
-                        pooled = self.user_encoder.attention_pooling(
+                        # Pool to get fixed-size vector
+                        pooled = self.user_encoder.temporal_pooling(
                             char_features
                         )  # (1, C)
                         

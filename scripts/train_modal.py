@@ -467,6 +467,8 @@ def train_react_emg(
         load_pretrained_encoder,
         load_pretrained_decoder,
     )
+    from src.models.user_encoder import UserEncoderConfig
+    from src.models.blocks import GRUTemporalPoolingConfig
     from src.utils.data import create_lazy_datasets_from_metadata
     
     log("=" * 60)
@@ -572,6 +574,15 @@ def train_react_emg(
     
     # Create model
     log("\nCreating model...")
+    # Build user encoder config from YAML (pooling_method, gru settings)
+    ue_cfg_yaml = model_cfg.get("user_encoder", {})
+    pooling_method = ue_cfg_yaml.get("pooling_method", "attention")
+    user_encoder_config = UserEncoderConfig(pooling_method=pooling_method)
+    if pooling_method == "gru":
+        gru_yaml = ue_cfg_yaml.get("gru_pooling", {})
+        if gru_yaml:
+            user_encoder_config.gru_pooling = GRUTemporalPoolingConfig(**gru_yaml)
+
     model_config = FiLMConditionedModelConfig(
         feature_dim=feature_dim,
         user_embedding_dim=user_embedding_dim,
@@ -580,7 +591,9 @@ def train_react_emg(
         predict_vel=model_cfg.get("predict_vel", False),
         provide_initial_pos=model_cfg.get("provide_initial_pos", False),
         state_condition=model_cfg.get("state_condition", True),
+        user_encoder=user_encoder_config,
     )
+    log(f"  pooling_method={model_config.user_encoder.pooling_method}")
     log(f"  predict_vel={model_config.predict_vel}, "
         f"provide_initial_pos={model_config.provide_initial_pos}, "
         f"state_condition={model_config.state_condition}")
