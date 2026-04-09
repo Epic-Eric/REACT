@@ -1,0 +1,119 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{salter2024emg2pose,ctrlabs2024generic}
+\citation{salter2024emg2pose}
+\citation{atzori2016electromyography,phinyomark2018feature}
+\citation{salter2024emg2pose}
+\citation{finn2017maml}
+\citation{perez2018film}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
+\citation{phinyomark2012feature,atzori2016electromyography}
+\citation{atzori2016deep}
+\citation{ctrlabs2024generic}
+\citation{rahimian2021fs}
+\citation{salter2024emg2pose}
+\citation{cote2019deep,du2017surface}
+\citation{ganin2016domain}
+\citation{cui2025cpep}
+\citation{perez2018film}
+\citation{dumoulin2017learned}
+\citation{oreshkin2018tadam}
+\citation{strezoski2019many}
+\citation{zhao2019adaptive}
+\citation{cho2014gru}
+\citation{lee2019set}
+\citation{salter2024emg2pose}
+\citation{hannun2019sequence}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Related Work}{2}{section.2}\protected@file@percent }
+\newlabel{sec:related}{{2}{2}{Related Work}{section.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{EMG-based hand pose estimation.}{2}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{User adaptation and personalization.}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Feature-wise Linear Modulation.}{2}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Temporal pooling and set aggregation.}{2}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Method}{2}{section.3}\protected@file@percent }
+\newlabel{sec:method}{{3}{2}{Method}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Problem formulation}{2}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:formulation}{{3.1}{2}{Problem formulation}{subsection.3.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Architecture overview}{2}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:architecture}{{3.2}{2}{Architecture overview}{subsection.3.2}{}}
+\citation{cho2014gru}
+\citation{lee2019set}
+\citation{loshchilov2019decoupled}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces REACT architecture. A pretrained TDS encoder maps raw EMG to temporal features. The conditioning pathway processes $k$ calibration recordings into a user embedding that drives a FiLM layer, which applies per-channel affine modulation $(\gamma , \beta )$ to the encoder features before the pretrained LSTM decoder.}}{3}{figure.caption.6}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:architecture}{{1}{3}{REACT architecture. A pretrained TDS encoder maps raw EMG to temporal features. The conditioning pathway processes $k$ calibration recordings into a user embedding that drives a FiLM layer, which applies per-channel affine modulation $(\gamma , \beta )$ to the encoder features before the pretrained LSTM decoder}{figure.caption.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Pretrained backbone}{3}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:backbone}{{3.3}{3}{Pretrained backbone}{subsection.3.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Conditioning}{3}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:conditioning}{{3.4}{3}{Conditioning}{subsection.3.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Training procedure}{3}{subsection.3.5}\protected@file@percent }
+\newlabel{sec:training}{{3.5}{3}{Training procedure}{subsection.3.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Phase 1: Adaptation module training (frozen backbone).}{3}{section*.7}\protected@file@percent }
+\citation{salter2024emg2pose}
+\citation{salter2024emg2pose}
+\citation{salter2024emg2pose}
+\citation{salter2024emg2pose}
+\@writefile{toc}{\contentsline {paragraph}{Phase 2: Joint fine-tuning (unfrozen backbone).}{4}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Loss function.}{4}{section*.9}\protected@file@percent }
+\newlabel{eq:loss}{{1}{4}{Loss function}{equation.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Data augmentation.}{4}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Experiments}{4}{section.4}\protected@file@percent }
+\newlabel{sec:experiments}{{4}{4}{Experiments}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Dataset}{4}{subsection.4.1}\protected@file@percent }
+\newlabel{sec:dataset}{{4.1}{4}{Dataset}{subsection.4.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces \textsc  {emg2pose} dataset statistics.}}{4}{table.caption.11}\protected@file@percent }
+\newlabel{tab:dataset}{{1}{4}{\textsc {emg2pose} dataset statistics}{table.caption.11}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Evaluation protocol}{4}{subsection.4.2}\protected@file@percent }
+\newlabel{sec:eval_protocol}{{4.2}{4}{Evaluation protocol}{subsection.4.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Quantitative results}{4}{subsection.4.3}\protected@file@percent }
+\newlabel{sec:main_results}{{4.3}{4}{Quantitative results}{subsection.4.3}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces \textbf  {Results at $k{=}15$ calibration recordings.} Angular error (degrees, $\downarrow $) and landmark distance (mm, $\downarrow $). Bold indicates best. REACT improves on all splits and modes.}}{5}{table.caption.12}\protected@file@percent }
+\newlabel{tab:results}{{2}{5}{\textbf {Results at $k{=}15$ calibration recordings.} Angular error (degrees, $\downarrow $) and landmark distance (mm, $\downarrow $). Bold indicates best. REACT improves on all splits and modes}{table.caption.12}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Qualitative results}{5}{subsection.4.4}\protected@file@percent }
+\newlabel{sec:qualitative}{{4.4}{5}{Qualitative results}{subsection.4.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces \textbf  {Top:} ground-truth mesh and keypoints from a camera-based tracker. \textbf  {Bottom:} REACT's predicted mesh and keypoints at the same timesteps, generated from wristband EMG of a held-out user.}}{5}{figure.caption.13}\protected@file@percent }
+\newlabel{fig:qualitative}{{2}{5}{\textbf {Top:} ground-truth mesh and keypoints from a camera-based tracker. \textbf {Bottom:} REACT's predicted mesh and keypoints at the same timesteps, generated from wristband EMG of a held-out user}{figure.caption.13}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Discussion}{5}{section.5}\protected@file@percent }
+\newlabel{sec:discussion}{{5}{5}{Discussion}{section.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why does FiLM conditioning work?}{5}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{GRU pooling outperforms attention pooling.}{5}{section*.15}\protected@file@percent }
+\bibstyle{plainnat}
+\bibcite{atzori2016electromyography}{{1}{2016a}{{Atzori et~al.}}{{}}}
+\bibcite{atzori2016deep}{{2}{2016b}{{Atzori et~al.}}{{}}}
+\bibcite{cho2014gru}{{3}{2014}{{Cho et~al.}}{{}}}
+\bibcite{cote2019deep}{{4}{2019}{{C{\^o}t{\'e}-Allard et~al.}}{{}}}
+\bibcite{ctrlabs2024generic}{{5}{2024}{{CTRL-labs at Reality Labs et~al.}}{{}}}
+\bibcite{cui2025cpep}{{6}{2025}{{Cui et~al.}}{{}}}
+\@writefile{toc}{\contentsline {paragraph}{Regression vs.\ tracking.}{6}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Limitations.}{6}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Conclusion}{6}{section.6}\protected@file@percent }
+\newlabel{sec:conclusion}{{6}{6}{Conclusion}{section.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Future work.}{6}{section*.18}\protected@file@percent }
+\bibcite{du2017surface}{{7}{2017}{{Du et~al.}}{{}}}
+\bibcite{dumoulin2017learned}{{8}{2017}{{Dumoulin et~al.}}{{}}}
+\bibcite{finn2017maml}{{9}{2017}{{Finn et~al.}}{{}}}
+\bibcite{ganin2016domain}{{10}{2016}{{Ganin et~al.}}{{}}}
+\bibcite{hannun2019sequence}{{11}{2019}{{Hannun et~al.}}{{}}}
+\bibcite{lee2019set}{{12}{2019}{{Lee et~al.}}{{}}}
+\bibcite{loshchilov2019decoupled}{{13}{2019}{{Loshchilov and Hutter}}{{}}}
+\bibcite{oreshkin2018tadam}{{14}{2018}{{Oreshkin et~al.}}{{}}}
+\bibcite{perez2018film}{{15}{2018}{{Perez et~al.}}{{}}}
+\bibcite{phinyomark2012feature}{{16}{2012}{{Phinyomark et~al.}}{{}}}
+\bibcite{phinyomark2018feature}{{17}{2018}{{Phinyomark and Scheme}}{{}}}
+\bibcite{rahimian2021fs}{{18}{2021}{{Rahimian et~al.}}{{}}}
+\bibcite{salter2024emg2pose}{{19}{2024}{{Salter et~al.}}{{}}}
+\bibcite{strezoski2019many}{{20}{2019}{{Strezoski et~al.}}{{}}}
+\bibcite{zhao2019adaptive}{{21}{2019}{{Zhao et~al.}}{{}}}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Implementation Details}{8}{appendix.A}\protected@file@percent }
+\newlabel{app:implementation}{{A}{8}{Implementation Details}{appendix.A}{}}
+\@writefile{toc}{\contentsline {paragraph}{Encoder architecture.}{8}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Decoder architecture.}{8}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{User encoder details.}{8}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Training hyperparameters.}{8}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Training infrastructure.}{8}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {B}Decoder Operating Modes}{8}{appendix.B}\protected@file@percent }
+\newlabel{app:modes}{{B}{8}{Decoder Operating Modes}{appendix.B}{}}
+\gdef \@abspage@last{8}
