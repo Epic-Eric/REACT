@@ -112,3 +112,6 @@ output:
 
 # Reproducibility (emg2pose default)
 seed: 42
+
+# training script: modal run --detach scripts/train_modal.py::main --config tracking
+# good checkpoint: /persistent/react_outputs/run_20260404_201604/best_model.pt

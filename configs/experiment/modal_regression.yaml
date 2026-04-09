@@ -1,4 +1,3 @@
-# modal run --detach scripts/train_modal.py::main --config tracking
 # Modal cloud training - REGRESSION mode
 # Aligned with emg2pose/config/experiment/regression_vemg2pose.yaml
 #
@@ -109,3 +108,5 @@ output:
 
 # Reproducibility (emg2pose default)
 seed: 42
+
+# training script: modal run --detach scripts/train_modal.py::main --config regression
